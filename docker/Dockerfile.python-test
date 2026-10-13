@@ -1,0 +1,14 @@
+# Reusable, version-pinned Python test image for DevRescue AI Docker sandbox
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install pinned pytest runner
+RUN pip install --no-cache-dir pytest==8.3.4
+
+WORKDIR /workspace
+CMD ["pytest"]
+

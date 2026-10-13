@@ -1,0 +1,15 @@
+[
+  "files_changed",
+  "lines_added",
+  "lines_removed",
+  "total_changed_lines",
+  "patch_size",
+  "functions_changed",
+  "classes_changed",
+  "cyclomatic_complexity",
+  "code_size",
+  "dependency_changes",
+  "test_count",
+  "tests_passed",
+  "tests_failed"
+]

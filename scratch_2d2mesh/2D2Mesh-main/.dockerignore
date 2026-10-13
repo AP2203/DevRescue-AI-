@@ -1,0 +1,40 @@
+# Never ship secrets into a build context.
+.env
+.env.*
+!*.example
+
+# VCS / tooling
+.git
+.gitignore
+.gitattributes
+.vscode
+.idea
+
+# Node
+**/node_modules
+**/dist
+**/.vite
+
+# Python
+**/__pycache__
+**/*.py[cod]
+**/.venv
+**/venv
+**/.mypy_cache
+**/.pytest_cache
+backend/install.log
+
+# Runtime data and local mounts
+storage
+models
+certs
+coverage
+htmlcov
+
+# Logs / OS
+*.log
+.DS_Store
+Thumbs.db
+
+# Docs (not needed inside images)
+README.md

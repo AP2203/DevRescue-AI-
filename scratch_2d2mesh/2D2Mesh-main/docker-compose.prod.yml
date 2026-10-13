@@ -1,0 +1,120 @@
+# ---- Vision3D AI - PRODUCTION -------------------------------------------------
+# Usage:
+#   cp .env.example .env            # fill in real values (Atlas, S3, secrets)
+#   openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
+#     -keyout certs/privkey.pem -out certs/fullchain.pem \
+#     -subj "/CN=vision3d.example.com"   # or use certbot (see README)
+#   docker compose -f docker-compose.prod.yml up -d --build
+#   docker compose -f docker-compose.prod.yml ps
+#   docker compose -f docker-compose.prod.yml logs -f backend
+#
+# Topology:
+#   nginx (80/443, TLS, rate limiting) -> frontend:80 (static SPA)
+#                                       -> backend:8000 (/api/*)
+#   backend (GPU) -> MongoDB Atlas + S3-compatible object storage
+#
+# GPU notes:
+#   - Requires the NVIDIA Container Toolkit on the host.
+#   - The `ai` build target installs torch/diffusers (several GB first build).
+
+name: vision3d-prod
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      target: ai
+    image: vision3d/backend:ai
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      ENVIRONMENT: production
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      LOG_JSON: "true"
+    # Same-origin /api calls come via nginx; keep the app process single so the
+    # in-process job worker and the loaded AI model stay in one process.
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "1"
+      - --proxy-headers
+      - --forwarded-allow-ips
+      - "*"
+    volumes:
+      - storage_data:/app/storage
+      # Custom model weights (optional). Mount your checkpoint dir and set
+      # MODEL_PATH=/models/vision3d-custom in .env.
+      - ./models:/models:ro
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    security_opt:
+      - no-new-privileges:true
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    image: vision3d/frontend:latest
+    restart: unless-stopped
+    expose:
+      - "80"
+    security_opt:
+      - no-new-privileges:true
+
+  # Edge reverse proxy: TLS termination, /api/* -> backend, / -> frontend.
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - backend
+      - frontend
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "--no-check-certificate", "https://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+
+  # Optional: self-hosted MongoDB instead of Atlas.
+  #   mongo:
+  #     image: mongo:7
+  #     restart: unless-stopped
+  #     volumes:
+  #       - mongo_data:/data/db
+  #     environment:
+  #       MONGO_INITDB_DATABASE: vision3d
+  #     expose: ["27017"]
+  # Then set DATABASE_URL=mongodb://mongo:27017 in .env.
+  #   mongo_data:
+
+volumes:
+  storage_data:

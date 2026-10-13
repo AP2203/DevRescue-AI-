@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1
+
+# ---- Vision3D AI backend -----------------------------------------------------
+# Multi-stage build. Two runtime targets:
+#
+#   api  -> CPU-only API image (fast to build, small). Use for dev/CI or
+#           when the AI stage runs on a separate GPU worker.
+#   ai   -> Full AI image with torch/diffusers for GPU inference.
+#
+# GPU support: PyTorch pip wheels bundle the CUDA runtime + cuDNN (nvidia-*
+# packages), so NO CUDA base image is needed. The host only requires:
+#   - an NVIDIA driver
+#   - the NVIDIA Container Toolkit (nvidia-container-toolkit)
+# Then run with `--gpus all` or a Compose `deploy.resources.reservations`.
+#
+# Build:
+#   CPU: docker build -f Dockerfile.backend --target api -t vision3d-backend:api .
+#   GPU: docker build -f Dockerfile.backend --target ai  -t vision3d-backend:ai  .
+#
+# Build context is the repository root (contains backend/ and frontend/).
+
+FROM python:3.12-slim AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HOME=/app
+
+WORKDIR /app
+
+# System deps for Pillow, OpenCV, trimesh, pymeshlab, etc.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root runtime user.
+RUN groupadd --system appuser \
+    && useradd --system --gid appuser --home /app appuser
+
+# ---- CPU-only API -------------------------------------------------------------
+FROM base AS api
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ---- Full AI image (GPU inference) ---------------------------------------------
+FROM base AS ai
+COPY backend/requirements-ai.txt backend/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements-ai.txt \
+    && pip install --no-cache-dir -r requirements.txt
+
+# ---- Final image ----------------------------------------------------------------
+# Select the stage with `--target` (or Compose `build.target`).
+ARG RUNTIME=api
+FROM ${RUNTIME} AS runtime
+
+COPY backend/app ./app
+COPY backend/.env.example ./.env.example
+
+RUN mkdir -p /app/storage \
+    && chown -R appuser:appuser /app
+
+USER appuser
+EXPOSE 8000
+
+# `/api/v1/health` returns 200 even when MongoDB is unreachable (degraded),
+# so the check fails fast on true process/liveness problems.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3).status == 200 else 1)"]
+
+# Use 1 worker: the in-process job worker + AI models are stateful per process.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

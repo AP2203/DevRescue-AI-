@@ -1,0 +1,10 @@
+# Heavy AI dependencies. Install separately: pip install -r requirements-ai.txt
+# These are imported lazily so the core API can run without a GPU.
+torch>=2.2.0
+diffusers>=0.29.0
+transformers>=4.40.0
+accelerate>=0.30.0
+safetensors>=0.4.0
+open3d>=0.18.0
+pymeshlab>=2023.12
+opencv-python-headless>=4.9.0

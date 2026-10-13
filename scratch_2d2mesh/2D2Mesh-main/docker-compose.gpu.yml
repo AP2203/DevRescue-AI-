@@ -1,0 +1,30 @@
+# ---- Vision3D AI - LOCAL DEVELOPMENT WITH GPU --------------------------------
+# Overlay on top of docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#
+# Rebuilds the backend with the heavy AI target (torch/diffusers, several GB)
+# and exposes the host's NVIDIA GPU(s) to the container.
+#
+# Host requirements:
+#   - NVIDIA driver (nvidia-smi works)
+#   - NVIDIA Container Toolkit: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+
+name: vision3d
+
+services:
+  backend:
+    build:
+      target: ai
+    environment:
+      AI_MODEL: stable-fast-3d
+      AI_DEVICE: cuda
+      STABLE_FAST_3D_DEVICE: cuda
+      HUNYUAN3D_DEVICE: cuda
+    shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

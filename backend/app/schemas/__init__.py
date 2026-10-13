@@ -1,0 +1,1 @@
+# DevRescue AI schemas package

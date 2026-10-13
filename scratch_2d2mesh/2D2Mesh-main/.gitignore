@@ -1,0 +1,42 @@
+<<<<<<< HEAD
+node_modules
+dist
+.env.local
+.env
+*.log
+.DS_Store
+=======
+# ---- Secrets (never commit these) ----
+.env
+.env.local
+.env.*.local
+!.env.example
+!backend/.env.example
+!frontend/.env.example
+
+# ---- Node ----
+node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Runtime data / local mounts ----
+storage/
+models/
+certs/
+
+# ---- Tooling / OS ----
+.idea/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db
+>>>>>>> f13dbf3e8c0dc57c3aadab7da20230b4a86ecb9d

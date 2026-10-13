@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+
+# ---- Vision3D AI frontend ------------------------------------------------------
+# Build context is the repository root.
+#
+# Build args:
+#   VITE_API_URL   -> API base URL the browser calls. Default `/api/v1`
+#                     (same-origin through the reverse proxy). For a separate
+#                     API host set e.g. `https://api.example.com/api/v1`.
+#   VITE_APP_NAME  -> App display name.
+#
+# Build:
+#   docker build -f Dockerfile.frontend -t vision3d-frontend:latest .
+
+FROM node:20-alpine AS build
+WORKDIR /app
+
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+
+COPY frontend/ .
+
+ARG VITE_API_URL=/api/v1
+ARG VITE_APP_NAME="Vision3D AI"
+ENV VITE_API_URL=${VITE_API_URL} \
+    VITE_APP_NAME=${VITE_APP_NAME}
+
+RUN npm run build
+
+# Static hosting (nginx). The public edge reverse proxy terminates TLS and
+# routes /api/* to the backend; this nginx only serves the built SPA.
+FROM nginx:1.27-alpine AS runtime
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+
+CMD ["nginx", "-g", "daemon off;"]

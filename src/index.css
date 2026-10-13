@@ -1,0 +1,119 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-bg: #FFFFFF;
+    --color-secondary: #F7F9FC;
+    --color-card: #FFFFFF;
+    --color-text-primary: #0F172A;
+    --color-text-secondary: #64748B;
+    --color-blue-primary: #2563EB;
+    --color-blue-dark: #1E3A8A;
+    --color-blue-hover: #1D4ED8;
+    --color-blue-light: #EFF6FF;
+    --color-border: #E2E8F0;
+    --color-success: #16A34A;
+    --color-warning: #D97706;
+    --color-error: #DC2626;
+    --color-code: #0F172A;
+  }
+
+  body {
+    background-color: #FFFFFF;
+    color: #0F172A;
+    font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    margin: 0;
+    padding: 0;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Smooth scrolling */
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+/* Subtle clean scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+/* Dark code editor area scrollbars */
+.dark-scroll::-webkit-scrollbar-thumb {
+  background: #334155;
+}
+.dark-scroll::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* Professional page entrance transition */
+.page-fade-in {
+  animation: pageFadeIn 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes pageFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Subtle pulse for in-progress agents */
+@keyframes agentPulse {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.2);
+    opacity: 0.6;
+  }
+}
+
+.agent-pulsing {
+  animation: agentPulse 1.8s ease-in-out infinite;
+}
+
+/* Shimmer animation for skeleton loaders */
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.skeleton-shimmer {
+  background: linear-gradient(90deg, #F1F5F9 25%, #E2E8F0 50%, #F1F5F9 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+/* Diff viewer line additions and removals */
+.diff-line-added {
+  background-color: rgba(22, 163, 74, 0.15);
+  color: #86EFAC;
+}
+.diff-line-removed {
+  background-color: rgba(220, 38, 38, 0.15);
+  color: #FCA5A5;
+}
