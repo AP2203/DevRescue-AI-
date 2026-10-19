@@ -194,14 +194,17 @@ async def github_callback(code: Optional[str] = None, state: Optional[str] = Non
         raise map_github_exception(e)
 
     # Create redirect response with secure HTTP-only session cookie
+    # When deployed to production (HTTPS / cross-domain Firebase <-> Render),
+    # cookies require SameSite=None and Secure=True for cross-origin credentials.
+    is_secure = settings.FRONTEND_URL.startswith("https://") or request.headers.get("x-forwarded-proto") == "https"
     redirect_url = f"{settings.FRONTEND_URL}/repositories?github_connected=true"
     response = RedirectResponse(url=redirect_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
     response.set_cookie(
         key=settings.SESSION_COOKIE_NAME,
         value=session_id,
         httponly=True,
-        samesite="lax",
-        secure=False,
+        samesite="none" if is_secure else "lax",
+        secure=is_secure,
         path="/",
         max_age=86400 * 7  # 7 days
     )

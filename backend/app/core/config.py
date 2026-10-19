@@ -11,6 +11,29 @@ if os.path.exists(env_path):
 else:
     load_dotenv()
 
+def _get_default_origins() -> List[str]:
+    frontend = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+    origins = {
+        frontend,
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "http://localhost:8001",
+        "http://127.0.0.1:8001"
+    }
+    if ".web.app" in frontend:
+        origins.add(frontend.replace(".web.app", ".firebaseapp.com"))
+    elif ".firebaseapp.com" in frontend:
+        origins.add(frontend.replace(".firebaseapp.com", ".web.app"))
+
+    custom_origins = os.getenv("ALLOWED_ORIGINS", "")
+    if custom_origins:
+        for item in custom_origins.split(","):
+            if item.strip():
+                origins.add(item.strip().rstrip("/"))
+    return sorted(list(origins))
+
 class Settings(BaseModel):
     PROJECT_NAME: str = "DevRescue AI Backend API"
     VERSION: str = "1.0.0"
@@ -18,15 +41,7 @@ class Settings(BaseModel):
     
     # Frontend URL & CORS
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:5173")
-    ALLOWED_ORIGINS: List[str] = [
-        os.getenv("FRONTEND_URL", "http://localhost:5173"),
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://localhost:8000",
-        "http://localhost:8001",
-        "http://127.0.0.1:8001"
-    ]
+    ALLOWED_ORIGINS: List[str] = _get_default_origins()
     
     # GitHub OAuth & API Configuration
     GITHUB_CLIENT_ID: Optional[str] = os.getenv("GITHUB_CLIENT_ID")

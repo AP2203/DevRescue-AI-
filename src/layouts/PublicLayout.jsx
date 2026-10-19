@@ -81,22 +81,10 @@ export default function PublicLayout() {
 
           {/* Desktop Actions */}
           <div className="hidden sm:flex items-center gap-3">
-            {user ? (
+            {user && (
               <Button to="/dashboard" variant="primary" size="sm" arrow={true}>
                 Go to Dashboard
               </Button>
-            ) : (
-              <>
-                <Link
-                  to="/login"
-                  className="text-sm font-medium text-[#64748B] hover:text-[#0F172A] px-3 py-1.5 transition-colors"
-                >
-                  Sign In
-                </Link>
-                <Button to="/login" variant="primary" size="sm" arrow={true}>
-                  Get Started
-                </Button>
-              </>
             )}
           </div>
 
@@ -142,24 +130,19 @@ export default function PublicLayout() {
                 );
               })}
             </nav>
-            <div className="pt-4 border-t border-[#E2E8F0] flex flex-col gap-2">
-              <Link
-                to="/login"
-                onClick={() => setMobileOpen(false)}
-                className="text-center text-sm font-medium text-[#64748B] py-2"
-              >
-                Sign In
-              </Link>
-              <Button
-                to="/login"
-                variant="primary"
-                size="md"
-                onClick={() => setMobileOpen(false)}
-                className="w-full justify-center"
-              >
-                Get Started
-              </Button>
-            </div>
+            {user && (
+              <div className="pt-4 border-t border-[#E2E8F0] flex flex-col gap-2">
+                <Button
+                  to="/dashboard"
+                  variant="primary"
+                  size="md"
+                  onClick={() => setMobileOpen(false)}
+                  className="w-full justify-center"
+                >
+                  Go to Dashboard
+                </Button>
+              </div>
+            )}
           </div>
         )}
       </header>
