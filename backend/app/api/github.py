@@ -150,11 +150,39 @@ def map_github_exception(exc: Exception):
 # -------------------------------------------------------------
 
 @router.get("/login")
-def github_login(redirect: bool = True):
+def github_login(request: Request, redirect: bool = True):
     """
     Initializes GitHub OAuth flow with state protection.
-    Redirects user to GitHub authorization page.
+    If GITHUB_CLIENT_ID is not configured (e.g. local dev / demo),
+    gracefully establishes an authenticated demo session instead of failing with 404 on github.com.
     """
+    if not settings.GITHUB_CLIENT_ID or not settings.GITHUB_CLIENT_ID.strip():
+        user_info = {
+            "id": 12345678,
+            "login": "devrescue-engineer",
+            "name": "DevRescue Engineer (Demo)",
+            "email": "engineer@devrescue.ai",
+            "avatar_url": "https://avatars.githubusercontent.com/u/9919?v=4",
+            "html_url": "https://github.com/AP2203/DevRescue-AI-",
+            "public_repos": 12
+        }
+        session_id = session_store.create_session("mock_github_token_for_demo", user_info)
+        is_secure = settings.FRONTEND_URL.startswith("https://") or request.headers.get("x-forwarded-proto") == "https"
+        redirect_url = f"{settings.FRONTEND_URL}/repositories?github_connected=true"
+        if not redirect:
+            return {"authenticated": True, "user": user_info, "session_id": session_id}
+        response = RedirectResponse(url=redirect_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+        response.set_cookie(
+            key=settings.SESSION_COOKIE_NAME,
+            value=session_id,
+            httponly=True,
+            samesite="none" if is_secure else "lax",
+            secure=is_secure,
+            path="/",
+            max_age=86400 * 7
+        )
+        return response
+
     state = session_store.create_oauth_state()
     try:
         auth_url = github_service.get_authorization_url(state)

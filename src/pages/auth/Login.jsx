@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
+import { useNavigate, useLocation, Link } from 'react-router-dom';
 import { Bug } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { PrimaryButton } from '../../components/common/Button';
@@ -21,29 +21,50 @@ export default function Login() {
   const [email, setEmail] = useState('ansh@devrescue.ai');
   const [password, setPassword] = useState('••••••••••••');
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
   const { login, loginWithGithub, loginWithGoogle } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
+  const destination = location.state?.from?.pathname || '/dashboard';
 
   const handleEmailSubmit = async (e) => {
     e.preventDefault();
+    setError('');
     setLoading(true);
-    await login(email, password);
-    setLoading(false);
-    navigate('/dashboard');
+    try {
+      await login(email, password);
+      navigate(destination, { replace: true });
+    } catch (err) {
+      setError(err?.message || 'Login failed. Please try again.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleGithub = async () => {
+    setError('');
     setLoading(true);
-    await loginWithGithub();
-    setLoading(false);
-    navigate('/dashboard');
+    try {
+      await loginWithGithub();
+      navigate(destination, { replace: true });
+    } catch (err) {
+      setError(err?.message || 'GitHub login failed.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleGoogle = async () => {
+    setError('');
     setLoading(true);
-    await loginWithGoogle();
-    setLoading(false);
-    navigate('/dashboard');
+    try {
+      await loginWithGoogle();
+      navigate(destination, { replace: true });
+    } catch (err) {
+      setError(err?.message || 'Google login failed.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -77,6 +98,13 @@ export default function Login() {
             Click below to instantly access the DevRescue console as demo user Ansh.
           </p>
         </div>
+
+        {/* Error message */}
+        {error && (
+          <div className="p-3 bg-red-50 border border-red-200 text-red-700 text-xs rounded-lg text-center">
+            {error}
+          </div>
+        )}
 
         {/* Quick Demo Access Button */}
         <PrimaryButton

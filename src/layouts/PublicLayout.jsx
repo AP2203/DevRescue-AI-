@@ -81,9 +81,13 @@ export default function PublicLayout() {
 
           {/* Desktop Actions */}
           <div className="hidden sm:flex items-center gap-3">
-            {user && (
+            {user ? (
               <Button to="/dashboard" variant="primary" size="sm" arrow={true}>
                 Go to Dashboard
+              </Button>
+            ) : (
+              <Button to="/login" variant="primary" size="sm" arrow={true}>
+                Sign In
               </Button>
             )}
           </div>
@@ -130,19 +134,17 @@ export default function PublicLayout() {
                 );
               })}
             </nav>
-            {user && (
-              <div className="pt-4 border-t border-[#E2E8F0] flex flex-col gap-2">
-                <Button
-                  to="/dashboard"
-                  variant="primary"
-                  size="md"
-                  onClick={() => setMobileOpen(false)}
-                  className="w-full justify-center"
-                >
-                  Go to Dashboard
-                </Button>
-              </div>
-            )}
+            <div className="pt-4 border-t border-[#E2E8F0] flex flex-col gap-2">
+              <Button
+                to={user ? "/dashboard" : "/login"}
+                variant="primary"
+                size="md"
+                onClick={() => setMobileOpen(false)}
+                className="w-full justify-center"
+              >
+                {user ? "Go to Dashboard" : "Sign In"}
+              </Button>
+            </div>
           </div>
         )}
       </header>
