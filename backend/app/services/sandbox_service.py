@@ -20,8 +20,11 @@ from app.services.github_service import (
     GitHubRateLimitError
 )
 import hashlib
-from app.services.diff_validator import diff_validator, DiffApplicationError, DiffValidationError
+from app.services.diff_validator import diff_validator, DiffApplicationError, DiffValidationError, DiffBindingError
 from app.schemas.sandbox import SandboxTestResponse
+from app.schemas.test_strategy import TestStrategyContract
+from app.services.profiler import repo_profiler
+from app.services.patch_service import is_test_file_path
 
 logger = logging.getLogger("devrescue.sandbox")
 
@@ -35,6 +38,7 @@ class TestFrameworkResult(tuple):
     Unpacks as 3-tuple (command, workdir, image) for backwards compatibility.
     Provides explicit attributes: command, workdir, image, framework.
     """
+    __test__ = False
     command: Optional[str]
     workdir: Optional[str]
     image: Optional[str]
@@ -118,6 +122,85 @@ def normalize_container_path(path: Optional[str]) -> str:
     while normalized.startswith("//"):
         normalized = normalized[1:]
     return normalized
+
+
+def validate_working_directory_override(workdir: Optional[str]) -> Tuple[bool, str, Optional[str]]:
+    """
+    Validates manual working directory override.
+    Guards against path traversal (../), absolute escapes, and paths outside /workspace.
+    Returns (is_valid, normalized_workdir, error_message).
+    """
+    if not workdir or not str(workdir).strip():
+        return True, "/workspace", None
+
+    raw = str(workdir).strip()
+
+    # Reject backslash path traversal or double-dot traversal attempts
+    normalized_separators = raw.replace("\\", "/")
+    segments = [s for s in normalized_separators.split("/") if s]
+    if ".." in segments:
+        return False, "", f"Path traversal sequence '..' detected in working directory override: {raw}"
+
+    # Normalize to POSIX container path
+    if normalized_separators.startswith("/workspace"):
+        norm = posixpath.normpath(normalized_separators)
+    elif normalized_separators.startswith("/"):
+        # Absolute path outside /workspace
+        return False, "", f"Working directory override must be inside /workspace: {raw}"
+    else:
+        norm = posixpath.normpath(posixpath.join("/workspace", normalized_separators))
+
+    if norm != "/workspace" and not norm.startswith("/workspace/"):
+        return False, "", f"Working directory override escapes /workspace root: {raw}"
+
+    return True, norm, None
+
+
+def validate_test_command_override(command: Optional[str]) -> Tuple[bool, Optional[str]]:
+    """
+    Validates manual test command override against approved test runners and frameworks.
+    Strictly forbids dangerous shell commands, destruction, downloads, and shell escalation.
+    Returns (is_valid, error_message).
+    """
+    if not command or not str(command).strip():
+        return False, "Test command override cannot be empty."
+
+    cmd = str(command).strip()
+
+    # Disallowed dangerous binary keywords / patterns
+    DANGEROUS_PATTERNS = [
+        r"\brm\s+", r"\brmdir\b", r"\bcurl\b", r"\bwget\b", r"\bnc\b", r"\bnetcat\b",
+        r"\bncat\b", r"\bbash\s+-i\b", r"\bsh\s+-i\b", r"\beval\b", r"\bexec\b",
+        r"\bmkfifo\b", r"\bsudo\b", r"\bchmod\s+777\b", r"\bdd\s+", r"/dev/tcp",
+        r":\(\)\s*\{\s*:\|:&\s*\};:", r"\bshutdown\b", r"\breboot\b"
+    ]
+    for pat in DANGEROUS_PATTERNS:
+        if re.search(pat, cmd, re.IGNORECASE):
+            return False, f"Test command override contains forbidden dangerous pattern matching '{pat}': {cmd}"
+
+    # Approved test runner prefixes
+    APPROVED_PREFIXES = (
+        "pytest", "py.test", "python -m unittest", "python -m pytest", "python3 -m unittest",
+        "python3 -m pytest", "python -m test", "python ", "python3 ",
+        "npm test", "npm run", "npx jest", "npx vitest", "npx mocha", "yarn test", "yarn run",
+        "pnpm test", "pnpm run", "mvn test", "./mvnw test", "mvn clean test", "./mvnw clean test",
+        "gradle test", "./gradlew test", "gradle check", "./gradlew check",
+        "go test", "cargo test", "tox", "poetry run", "pipenv run"
+    )
+
+    # For compound commands with ; or &&, verify all subcommands start with approved prefixes
+    subcommands = re.split(r"[;&|]+", cmd)
+    for sub in subcommands:
+        sub_clean = sub.strip()
+        if not sub_clean:
+            continue
+        for pat in DANGEROUS_PATTERNS:
+            if re.search(pat, sub_clean, re.IGNORECASE):
+                return False, f"Forbidden dangerous command token in sub-command '{sub_clean}'"
+        if not any(sub_clean.startswith(prefix) or sub_clean == prefix.strip() for prefix in APPROVED_PREFIXES):
+            return False, f"Test command override '{sub_clean}' is not an approved test runner command."
+
+    return True, None
 
 
 def flatten_nested_root_folder(target_dir: str) -> None:
@@ -256,23 +339,28 @@ def parse_test_metrics(test_cmd: Optional[str], stdout: str, stderr: Optional[st
     if not combined.strip():
         return None, None, None
 
-    # 1. Pytest regex: e.g. "5 passed, 1 failed in 2.3s" or "10 passed in 1.1s"
-    passed_m = re.search(r'(\d+)\s+passed', combined)
-    failed_m = re.search(r'(\d+)\s+failed', combined)
-    skipped_m = re.search(r'(\d+)\s+skipped', combined)
-    error_m = re.search(r'(\d+)\s+errors?', combined)
+    # 1. Java Maven / Surefire: "[INFO] Tests run: 12, Failures: 1, Errors: 0, Skipped: 1"
+    maven_m = re.search(r'Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)', combined)
+    if maven_m:
+        total = int(maven_m.group(1))
+        failures = int(maven_m.group(2))
+        errors = int(maven_m.group(3))
+        skipped = int(maven_m.group(4))
+        tests_failed = failures + errors
+        tests_passed = max(0, total - tests_failed - skipped)
+        return total, tests_passed, tests_failed
 
-    if passed_m or failed_m:
-        p = int(passed_m.group(1)) if passed_m else 0
-        f = int(failed_m.group(1)) if failed_m else 0
-        s = int(skipped_m.group(1)) if skipped_m else 0
-        e = int(error_m.group(1)) if error_m else 0
-        tests_passed = p
-        tests_failed = f + e
-        tests_run = p + f + s + e
-        return tests_run, tests_passed, tests_failed
+    # 2. Java Gradle: "12 tests completed, 1 failed, 1 skipped"
+    gradle_m = re.search(r'(\d+)\s+tests? completed,\s*(\d+)\s+failed(?:,\s*(\d+)\s+skipped)?', combined)
+    if gradle_m:
+        total = int(gradle_m.group(1))
+        failures = int(gradle_m.group(2))
+        skipped = int(gradle_m.group(3)) if gradle_m.group(3) else 0
+        tests_failed = failures
+        tests_passed = max(0, total - tests_failed - skipped)
+        return total, tests_passed, tests_failed
 
-    # 2. Jest regex: "Tests:  1 failed, 4 passed, 5 total"
+    # 3. Jest regex: "Tests:  1 failed, 4 passed, 5 total"
     jest_total = re.search(r'Tests:\s+.*?(\d+)\s+total', combined)
     jest_passed = re.search(r'Tests:\s+.*?(\d+)\s+passed', combined)
     jest_failed = re.search(r'Tests:\s+.*?(\d+)\s+failed', combined)
@@ -282,7 +370,7 @@ def parse_test_metrics(test_cmd: Optional[str], stdout: str, stderr: Optional[st
         tests_failed = int(jest_failed.group(1)) if jest_failed else 0
         return tests_run, tests_passed, tests_failed
 
-    # 3. Vitest regex: "Tests  1 failed | 4 passed (5)" or "Tests  4 passed (4)"
+    # 4. Vitest regex: "Tests  1 failed | 4 passed (5)" or "Tests  4 passed (4)"
     vitest_m = re.search(r'Tests\s+(?:(\d+)\s+failed\s*\|?\s*)?(?:(\d+)\s+passed\s*\|?\s*)?(?:(\d+)\s+skipped\s*\|?\s*)?\((\d+)\)', combined)
     if vitest_m:
         f = int(vitest_m.group(1)) if vitest_m.group(1) else 0
@@ -290,7 +378,7 @@ def parse_test_metrics(test_cmd: Optional[str], stdout: str, stderr: Optional[st
         total = int(vitest_m.group(4))
         return total, p, f
 
-    # 4. Unittest: "Ran 5 tests in ... OK" or "FAILED (failures=1)"
+    # 5. Unittest: "Ran 5 tests in ... OK" or "FAILED (failures=1)"
     unittest_m = re.search(r'Ran\s+(\d+)\s+tests?', combined)
     if unittest_m:
         tests_run = int(unittest_m.group(1))
@@ -309,18 +397,92 @@ def parse_test_metrics(test_cmd: Optional[str], stdout: str, stderr: Optional[st
             tests_failed = 0
         return tests_run, tests_passed, tests_failed
 
+    # 6. Pytest regex: e.g. "5 passed, 1 failed in 2.3s" or "10 passed in 1.1s"
+    passed_m = re.search(r'(\d+)\s+passed', combined)
+    failed_m = re.search(r'(\d+)\s+failed', combined)
+    skipped_m = re.search(r'(\d+)\s+skipped', combined)
+    error_m = re.search(r'(\d+)\s+errors?', combined)
+
+    if passed_m or failed_m:
+        p = int(passed_m.group(1)) if passed_m else 0
+        f = int(failed_m.group(1)) if failed_m else 0
+        s = int(skipped_m.group(1)) if skipped_m else 0
+        e = int(error_m.group(1)) if error_m else 0
+        tests_passed = p
+        tests_failed = f + e
+        tests_run = p + f + s + e
+        return tests_run, tests_passed, tests_failed
+
+    # 7. Rust / Cargo: "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s"
+    rust_m = re.search(r'test result:\s+(?:ok|FAILED)\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;\s+(\d+)\s+ignored', combined)
+    if rust_m:
+        passed = int(rust_m.group(1))
+        failed = int(rust_m.group(2))
+        ignored = int(rust_m.group(3))
+        total = passed + failed + ignored
+        return total, passed, failed
+
+    # 8. Go test: "--- PASS: TestName (0.00s)" and "--- FAIL: TestName (0.01s)" or package summary
+    pass_go = len(re.findall(r'---\s+PASS:\s+', combined))
+    fail_go = len(re.findall(r'---\s+FAIL:\s+', combined))
+    skip_go = len(re.findall(r'---\s+SKIP:\s+', combined))
+    if pass_go > 0 or fail_go > 0 or skip_go > 0:
+        total = pass_go + fail_go + skip_go
+        return total, pass_go, fail_go
+    if re.search(r'\bok\s+\S+\s+[0-9\.]+s', combined) and pass_go == 0 and fail_go == 0:
+        return 1, 1, 0
+
+    # 8b. Node.js built-in test runner (`node --test`) - TAP reporter:
+    #     "# tests 5\n# pass 4\n# fail 1\n# skipped 0"
+    node_tap_m = re.search(r'^[ \t]*#[ \t]*tests[ \t]+(\d+)', combined, re.MULTILINE)
+    if node_tap_m:
+        total = int(node_tap_m.group(1))
+        node_tap_pass = re.search(r'^[ \t]*#[ \t]*pass[ \t]+(\d+)', combined, re.MULTILINE)
+        node_tap_fail = re.search(r'^[ \t]*#[ \t]*fail[ \t]+(\d+)', combined, re.MULTILINE)
+        p = int(node_tap_pass.group(1)) if node_tap_pass else 0
+        f = int(node_tap_fail.group(1)) if node_tap_fail else 0
+        return total, p, f
+
+    # 8c. Node.js built-in test runner (`node --test`) - spec reporter:
+    #     "i tests 5\ni pass 4\ni fail 1" (the leading glyph may be U+2139 "ℹ")
+    node_spec_m = re.search(r'^[ \t]*(?:\u2139|i)[ \t]+tests[ \t]+(\d+)', combined, re.MULTILINE)
+    if node_spec_m:
+        total = int(node_spec_m.group(1))
+        node_spec_pass = re.search(r'^[ \t]*(?:\u2139|i)[ \t]+pass[ \t]+(\d+)', combined, re.MULTILINE)
+        node_spec_fail = re.search(r'^[ \t]*(?:\u2139|i)[ \t]+fail[ \t]+(\d+)', combined, re.MULTILINE)
+        p = int(node_spec_pass.group(1)) if node_spec_pass else 0
+        f = int(node_spec_fail.group(1)) if node_spec_fail else 0
+        return total, p, f
+
+    # 9. Zero tests / no test files found across Jest, Pytest, Vitest, Go, Rust
+    combined_lower = combined.lower()
+    if (
+        "no tests found" in combined_lower
+        or "no test files found" in combined_lower
+        or "- 0 matches" in combined_lower
+        or "pattern:  - 0 matches" in combined_lower
+        or "collected 0 items" in combined_lower
+        or "--passwithnotests" in combined_lower
+        or "[no test files]" in combined_lower
+        or "running 0 tests" in combined_lower
+    ):
+        return 0, 0, 0
+
     return None, None, None
 
 
 def parse_test_duration(test_cmd: Optional[str], stdout: str, stderr: Optional[str] = None) -> Optional[float]:
     """
     Parses test runner output to extract the actual test execution duration reported by the test runner.
-    Supports Pytest, Jest, Vitest, and unittest across stdout and stderr.
+    Supports Pytest, Jest, Vitest, unittest, Maven, Gradle, Go, and Cargo across stdout and stderr.
     Examples:
       Pytest: "=== 65 passed in 16.14s ===" -> 16.14
       Jest: "Time: 16.14 s" -> 16.14
       Vitest: "Duration 16.14s" -> 16.14
       Unittest: "Ran 5 tests in 0.012s" -> 0.01
+      Maven: "Total time:  12.345 s" -> 12.35
+      Rust: "finished in 0.05s" -> 0.05
+      Go: "ok  pkg 0.12s" -> 0.12
     """
     combined = f"{stdout or ''}\n{stderr or ''}"
     if not combined.strip():
@@ -367,7 +529,32 @@ def parse_test_duration(test_cmd: Optional[str], stdout: str, stderr: Optional[s
         except ValueError:
             pass
 
+    # 5. Maven: e.g. "Total time:  12.345 s" or "Time elapsed: 1.234 s"
+    maven_time_m = re.search(r'(?:Time elapsed|Total time):\s+([0-9]+(?:\.[0-9]+)?)\s*s\b', combined, re.IGNORECASE)
+    if maven_time_m:
+        try:
+            return round(float(maven_time_m.group(1)), 2)
+        except ValueError:
+            pass
+
+    # 6. Rust / Cargo: "finished in 0.05s"
+    rust_time_m = re.search(r'finished in\s+([0-9]+(?:\.[0-9]+)?)\s*s\b', combined, re.IGNORECASE)
+    if rust_time_m:
+        try:
+            return round(float(rust_time_m.group(1)), 2)
+        except ValueError:
+            pass
+
+    # 7. Go test: "ok  pkg 0.12s" or "FAIL pkg 0.12s"
+    go_time_m = re.search(r'\b(?:ok|FAIL)\s+\S+\s+([0-9]+(?:\.[0-9]+)?)\s*s\b', combined)
+    if go_time_m:
+        try:
+            return round(float(go_time_m.group(1)), 2)
+        except ValueError:
+            pass
+
     return None
+
 
 
 def _sanitize_error(err: Any) -> str:
@@ -651,12 +838,19 @@ class SandboxService:
         return dirname in ignored or (dirname.startswith(".") and dirname not in (".", ".."))
 
     def _has_python_test_files(self, directory: str) -> bool:
-        """Checks if a directory contains any test_*.py or *_test.py files."""
+        """Checks if a directory contains any Python test files or is a test directory with .py files."""
         if not os.path.isdir(directory):
             return False
         try:
+            base_name = os.path.basename(directory.rstrip("/\\")).lower()
+            in_test_dir = base_name in ("tests", "test", "testing", "unit_tests", "tests_unit", "__tests__")
             for item in os.listdir(directory):
-                if item.endswith(".py") and (item.startswith("test_") or item.endswith("_test.py")):
+                if not item.endswith(".py") or item in ("__init__.py", "conftest.py", "setup.py"):
+                    continue
+                item_lower = item.lower()
+                if item_lower.startswith("test") or item_lower.endswith("_test.py") or item_lower.endswith("tests.py") or item_lower == "test.py":
+                    return True
+                if in_test_dir:
                     return True
         except Exception:
             pass
@@ -2056,7 +2250,9 @@ class SandboxService:
             framework = "npm"
             dev_deps = pkg_data.get("devDependencies", {})
             deps = pkg_data.get("dependencies", {})
-            if "vitest" in test_lower or "vitest" in dev_deps or "vitest" in deps:
+            if "node --test" in test_lower or "node:test" in test_lower:
+                framework = "node"
+            elif "vitest" in test_lower or "vitest" in dev_deps or "vitest" in deps:
                 framework = "vitest"
             elif "jest" in test_lower or "jest" in dev_deps or "jest" in deps:
                 framework = "jest"
@@ -2068,6 +2264,37 @@ class SandboxService:
             logger.warning(f"[SANDBOX] Failed to inspect package.json at {pkg_path}: {e}")
             return False, None, None
 
+    def _check_java_dir(self, directory: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
+        """
+        Inspects directory for Java (Maven or Gradle) test configuration.
+        Returns (is_configured, command, framework, image).
+        """
+        if not os.path.isdir(directory):
+            return False, None, None, None
+
+        pom_path = os.path.join(directory, "pom.xml")
+        if os.path.isfile(pom_path):
+            java_image = "maven:3.9-eclipse-temurin-17"
+            try:
+                with open(pom_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                if "<java.version>21</java.version>" in content or "<maven.compiler.source>21</maven.compiler.source>" in content:
+                    java_image = "maven:3.9-eclipse-temurin-21"
+                elif "<java.version>11</java.version>" in content or "<maven.compiler.source>11</maven.compiler.source>" in content:
+                    java_image = "maven:3.9-eclipse-temurin-11"
+            except Exception:
+                pass
+            return True, "mvn test", "maven", java_image
+
+        for gname in ("build.gradle", "build.gradle.kts"):
+            gpath = os.path.join(directory, gname)
+            if os.path.isfile(gpath):
+                gradlew = os.path.join(directory, "gradlew")
+                cmd = "./gradlew test" if os.path.isfile(gradlew) else "gradle test"
+                return True, cmd, "gradle", "gradle:8.5-jdk17"
+
+        return False, None, None, None
+
     def detect_test_framework(
         self,
         workspace_dir: str,
@@ -2076,10 +2303,25 @@ class SandboxService:
         """
         Inspects repository files to detect the appropriate test framework.
         Supports root-level projects, nested directories, and monorepos.
+        Supports Python, Node.js, Java (Maven/Gradle), Go, and Rust.
         Returns TestFrameworkResult(command, container_workdir, docker_image, framework).
         """
         if not os.path.isdir(workspace_dir):
             return TestFrameworkResult(None, None, None, None)
+
+        try:
+            strategy = repo_profiler.evaluate_test_strategy(workspace_dir, changed_files)
+            if strategy.status in ("READY", "NO_TESTS_FOUND") and strategy.test_command:
+                return TestFrameworkResult(
+                    command=strategy.test_command,
+                    workdir=strategy.container_workdir,
+                    image=strategy.docker_image,
+                    framework=strategy.test_framework
+                )
+            elif strategy.status in ("TESTS_NOT_CONFIGURED", "UNSUPPORTED_PROJECT"):
+                return TestFrameworkResult(None, None, None, None)
+        except Exception as e:
+            logger.warning(f"[SANDBOX] Profiler evaluation failed in detect_test_framework: {e}")
 
         candidates = []
 
@@ -2092,6 +2334,10 @@ class SandboxService:
         if is_node:
             _, node_img = self.detect_node_runtime_version(workspace_dir)
             candidates.append({"rel_dir": "", "command": node_cmd, "framework": node_fw, "image": node_img})
+
+        is_java, java_cmd, java_fw, java_img = self._check_java_dir(workspace_dir)
+        if is_java:
+            candidates.append({"rel_dir": "", "command": java_cmd, "framework": java_fw, "image": java_img})
 
         # Recursively search subdirectories (up to max depth 3)
         for root, dirs, _ in os.walk(workspace_dir):
@@ -2114,6 +2360,10 @@ class SandboxService:
             if is_node:
                 _, node_img = self.detect_node_runtime_version(root, workspace_dir)
                 candidates.append({"rel_dir": rel_root, "command": node_cmd, "framework": node_fw, "image": node_img})
+
+            is_java, java_cmd, java_fw, java_img = self._check_java_dir(root)
+            if is_java:
+                candidates.append({"rel_dir": rel_root, "command": java_cmd, "framework": java_fw, "image": java_img})
 
         if not candidates:
             return TestFrameworkResult(None, None, None, None)
@@ -2163,13 +2413,125 @@ class SandboxService:
             framework=best_candidate["framework"]
         )
 
+    def _verify_patch_binding(
+        self,
+        patch: str,
+        binding: Optional[Dict[str, Any]],
+        owner: Optional[str],
+        repo: Optional[str]
+    ) -> None:
+        """
+        Verifies a patch's provenance binding before it may touch a workspace.
+        Rejects: patch-hash mismatch (tampered/substituted artifact) and any
+        repository mismatch (patch generated for a different owner/repo).
+        """
+        if not binding:
+            return
+        expected_hash = binding.get("patch_sha256")
+        if expected_hash:
+            actual_hash = hashlib.sha256((patch or "").encode("utf-8")).hexdigest()
+            if actual_hash != expected_hash:
+                raise DiffBindingError(
+                    f"Patch SHA-256 mismatch: binding expected {str(expected_hash)[:12]}... "
+                    f"but received {actual_hash[:12]}.... Refusing to apply an unverified patch artifact.",
+                    details={"patch_hash_mismatch": True, "expected": expected_hash, "actual": actual_hash}
+                )
+        b_owner = binding.get("owner")
+        b_repo = binding.get("repo")
+        if b_owner and b_repo and owner and repo and (b_owner != owner or b_repo != repo):
+            raise DiffBindingError(
+                f"Patch is bound to repository '{b_owner}/{b_repo}' but the active workspace is "
+                f"'{owner}/{repo}'. Refusing cross-repository patch application.",
+                details={
+                    "repo_mismatch": True,
+                    "binding_repo": f"{b_owner}/{b_repo}",
+                    "active_repo": f"{owner}/{repo}",
+                }
+            )
+
+    def _resolve_workspace_target(
+        self,
+        workspace_dir: str,
+        rel_path: str,
+        owner: Optional[str] = None,
+        repo: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Strictly resolves a patch's repository-relative path to a workspace file.
+
+        Returns the absolute disk path, or None if there is genuinely no such file
+        (used for new-file creation). Raises DiffBindingError when the path only
+        matches a workspace file by carrying an extra leading segment (cross-repo
+        contamination) or when a match is ambiguous. Patch target paths are never
+        silently rewritten to force a patch to apply.
+        """
+        exact = os.path.join(workspace_dir, rel_path.replace("/", os.sep))
+        if os.path.isfile(exact):
+            return exact
+
+        # Explicit strip of the active repository's own name prefix, if present.
+        prefixes: List[str] = []
+        if repo:
+            prefixes.append(f"{repo}/")
+        if owner and repo:
+            prefixes.append(f"{owner}/{repo}/")
+        for prefix in prefixes:
+            if rel_path.startswith(prefix):
+                cand_rel = rel_path[len(prefix):]
+                cand = os.path.join(workspace_dir, cand_rel.replace("/", os.sep))
+                if os.path.isfile(cand):
+                    return cand
+
+        rel_files: List[Tuple[str, str]] = []
+        for root, _, files in os.walk(workspace_dir):
+            for fname in files:
+                full = os.path.join(root, fname)
+                rel = os.path.relpath(full, workspace_dir).replace("\\", "/")
+                rel_files.append((rel, full))
+
+        # Benign layout case: patch path is a suffix of exactly one workspace file.
+        suffix_matches = [(rel, full) for rel, full in rel_files if rel.endswith("/" + rel_path)]
+        if len(suffix_matches) == 1:
+            return suffix_matches[0][1]
+        if len(suffix_matches) > 1:
+            raise DiffBindingError(
+                f"Patch target '{rel_path}' ambiguously matches multiple workspace files: "
+                f"{[r for r, _ in suffix_matches]}. Refusing to guess a binding.",
+                file=rel_path,
+                details={"ambiguous_target": True, "candidates": [r for r, _ in suffix_matches]}
+            )
+
+        # Contamination case: patch path carries extra leading segments relative to a
+        # workspace file (e.g. 'other-repo/src/x.py' vs workspace 'src/x.py').
+        foreign_matches = [(rel, full) for rel, full in rel_files if rel_path.endswith("/" + rel)]
+        if foreign_matches:
+            active = f"{owner}/{repo}" if owner and repo else "the active repository"
+            raise DiffBindingError(
+                f"Patch target '{rel_path}' does not belong to {active}; it only matches workspace "
+                f"file '{foreign_matches[0][0]}' by trailing path. Refusing to apply a patch generated "
+                f"for a different repository.",
+                file=rel_path,
+                details={
+                    "repo_mismatch": True,
+                    "foreign_path": rel_path,
+                    "context_file": foreign_matches[0][0],
+                    "active_owner": owner,
+                    "active_repo": repo,
+                }
+            )
+
+        return None
+
     def apply_patch_to_workspace(
         self,
         workspace_dir: str,
         patch: str,
         expected_contents: Optional[Dict[str, str]] = None,
         expected_shas: Optional[Dict[str, str]] = None,
-        expected_source_hashes: Optional[Dict[str, str]] = None
+        expected_source_hashes: Optional[Dict[str, str]] = None,
+        owner: Optional[str] = None,
+        repo: Optional[str] = None,
+        binding: Optional[Dict[str, Any]] = None
     ) -> List[str]:
         """
         Applies validated unified diff patch to repository files in workspace_dir.
@@ -2181,6 +2543,9 @@ class SandboxService:
         """
         # Validate patch syntax and limits before touching workspace
         diff_validator.validate_syntax_and_limits(patch)
+
+        # Verify provenance binding (repository + validated patch hash) before apply
+        self._verify_patch_binding(patch, binding, owner, repo)
 
         per_file_diffs = diff_validator.split_per_file_diffs(patch)
         if not per_file_diffs:
@@ -2194,51 +2559,31 @@ class SandboxService:
             if rel_path == "/dev/null":
                 continue
 
-            target_disk_path = os.path.join(workspace_dir, rel_path.replace("/", os.sep))
+            is_new_file = "--- /dev/null" in file_diff or "new file mode" in file_diff
 
-            # If path does not exist directly, attempt search by normalized relative path
-            if not os.path.isfile(target_disk_path):
-                found = False
-                for root, _, files in os.walk(workspace_dir):
-                    for file in files:
-                        full = os.path.join(root, file)
-                        r = os.path.relpath(full, workspace_dir).replace("\\", "/")
-                        if r == rel_path or r.endswith("/" + rel_path.lstrip("/")) or rel_path.endswith("/" + r.lstrip("/")):
-                            target_disk_path = full
-                            found = True
-                            break
-                    if found:
-                        break
-
-                # For new files or subproject layouts, map relative paths to existing subproject folders
-                if not found:
-                    for prefix in ("backend", "src", "client", "server"):
-                        candidate = os.path.join(workspace_dir, prefix, rel_path.replace("/", os.sep))
-                        prefix_dir = os.path.join(workspace_dir, prefix)
-                        first_part = rel_path.split("/")[0]
-                        if os.path.isdir(prefix_dir) and not os.path.isdir(os.path.join(workspace_dir, first_part)):
-                            if os.path.isdir(os.path.join(prefix_dir, first_part)) or os.path.isfile(os.path.join(prefix_dir, rel_path.replace("/", os.sep))):
-                                target_disk_path = candidate
-                                break
-                            elif "--- /dev/null" in file_diff and (prefix == "backend" and (first_part in ("app", "tests"))):
-                                target_disk_path = candidate
-                                break
+            # Strict, binding-aware resolution. Never rewrite a patch's target path
+            # across repositories to make it apply.
+            target_disk_path = self._resolve_workspace_target(
+                workspace_dir, rel_path, owner=owner, repo=repo
+            )
 
             # If creating a new file
-            if "--- /dev/null" in file_diff or not os.path.isfile(target_disk_path):
-                if "--- /dev/null" in file_diff:
-                    res = diff_validator._apply_hunks("", file_diff, file_path=rel_path)
-                    if not res.success:
-                        raise DiffApplicationError(
-                            f"Failed to create new file '{rel_path}': {res.error}",
-                            file=rel_path,
-                            hunk=res.failed_hunk,
-                            details=res.details
-                        )
-                    staged_writes[target_disk_path] = res.new_content
-                    modified_files.append(rel_path)
-                    continue
+            if is_new_file:
+                if target_disk_path is None:
+                    target_disk_path = os.path.join(workspace_dir, rel_path.replace("/", os.sep))
+                res = diff_validator._apply_hunks("", file_diff, file_path=rel_path)
+                if not res.success:
+                    raise DiffApplicationError(
+                        f"Failed to create new file '{rel_path}': {res.error}",
+                        file=rel_path,
+                        hunk=res.failed_hunk,
+                        details=res.details
+                    )
+                staged_writes[target_disk_path] = res.new_content
+                modified_files.append(rel_path)
+                continue
 
+            if target_disk_path is None:
                 raise DiffApplicationError(
                     f"Target file for patch '{rel_path}' not found in workspace.",
                     file=rel_path
@@ -2360,8 +2705,46 @@ class SandboxService:
             branch=branch,
             issue_number=issue_number,
             patch=target_patch,
-            access_token=access_token
+            access_token=access_token,
+            working_directory_override=kwargs.get("working_directory_override"),
+            test_command_override=kwargs.get("test_command_override"),
+            binding=kwargs.get("binding")
         )
+
+    @staticmethod
+    def classify_dependency_ecosystem(
+        framework: Optional[str],
+        docker_image: Optional[str],
+        host_project_dir: Optional[str] = None,
+    ) -> str:
+        """
+        Decide which dependency-preparation ecosystem a resolved test strategy
+        belongs to: "python", "node", "java", "go", "rust", or "none".
+
+        The resolved framework/image is authoritative. A stray manifest must
+        never flip a Python (pytest/unittest) run into Node preparation just
+        because a polyglot workspace root happens to contain a package.json
+        (the exact bug that produced a misleading DEPENDENCIES_UNAVAILABLE when
+        `npm` was run inside the Python base image).
+        """
+        fw = (framework or "").lower()
+        img = (docker_image or "").lower()
+
+        if fw in ("pytest", "unittest") or docker_image == DEFAULT_PYTHON_IMAGE or "python" in img:
+            return "python"
+        if fw in ("jest", "vitest", "mocha", "npm", "node") or "node" in img:
+            return "node"
+        if fw in ("maven", "gradle", "junit") or "maven" in img or "gradle" in img:
+            return "java"
+        if "golang" in img or fw == "go":
+            return "go"
+        if "rust" in img or fw == "cargo":
+            return "rust"
+
+        # Fall back to manifest presence only when the strategy was ambiguous.
+        if host_project_dir and os.path.isfile(os.path.join(host_project_dir, "package.json")):
+            return "node"
+        return "none"
 
     async def execute_sandbox_test(
         self,
@@ -2370,7 +2753,10 @@ class SandboxService:
         branch: str,
         issue_number: int,
         patch: str,
-        access_token: Optional[str] = None
+        access_token: Optional[str] = None,
+        working_directory_override: Optional[str] = None,
+        test_command_override: Optional[str] = None,
+        binding: Optional[Dict[str, Any]] = None
     ) -> SandboxTestResponse:
         """
         Executes end-to-end sandbox testing pipeline:
@@ -2389,6 +2775,9 @@ class SandboxService:
 
         # 1. Diff validation pre-check
         try:
+            # Reject patches bound to a different repository / non-matching artifact
+            # before any workspace or container work begins.
+            self._verify_patch_binding(patch, binding, owner, repo)
             files_changed, _, _ = diff_validator.validate_syntax_and_limits(patch)
         except (DiffValidationError, ValueError) as dve:
             safe_err = _sanitize_error(dve)
@@ -2521,10 +2910,34 @@ class SandboxService:
             patch_file_count = len([f for f in per_file_blocks if f != "/dev/null"])
             logger.info(f"[SANDBOX] Applying validated patch ({patch_file_count} file(s) in diff) to workspace files...")
             print(f"[SANDBOX] Applying validated patch ({patch_file_count} file(s) in diff) to workspace files...", flush=True)
+            has_synthesized_test = False
             try:
-                applied_files = self.apply_patch_to_workspace(workspace_dir, patch)
-                logger.info(f"[SANDBOX] Patch application result: {len(applied_files)} files modified/created in workspace: {applied_files}")
-                print(f"[SANDBOX] Patch application result: {len(applied_files)} files modified/created in workspace: {applied_files}", flush=True)
+                # Verify the recorded base commit (if any) matches the checkout.
+                bound_commit = (binding or {}).get("base_commit")
+                if bound_commit and commit_sha and bound_commit != commit_sha:
+                    return SandboxTestResponse(
+                        success=False,
+                        status="PATCH_FAILED",
+                        message=(
+                            f"Patch base-commit mismatch: patch was generated against {str(bound_commit)[:12]}... "
+                            f"but workspace checkout is {str(commit_sha)[:12]}.... Refusing stale/cross-commit application."
+                        ),
+                        exit_code=1,
+                        stderr="STALE_BASE_COMMIT: patch base commit does not match repository checkout."
+                    )
+                applied_files = self.apply_patch_to_workspace(
+                    workspace_dir, patch, owner=owner, repo=repo, binding=binding
+                )
+                has_synthesized_test = any(
+                    is_test_file_path(f) and (
+                        "--- /dev/null" in per_file_blocks.get(f, "")
+                        or "new file mode" in per_file_blocks.get(f, "")
+                        or any(f.endswith(k) and ("--- /dev/null" in v or "new file mode" in v) for k, v in per_file_blocks.items())
+                    )
+                    for f in (applied_files or [])
+                )
+                logger.info(f"[SANDBOX] Patch application result: {len(applied_files)} files modified/created in workspace (synthesized test: {has_synthesized_test}): {applied_files}")
+                print(f"[SANDBOX] Patch application result: {len(applied_files)} files modified/created in workspace (synthesized test: {has_synthesized_test}): {applied_files}", flush=True)
                 logger.info(f"[SANDBOX] Final workspace path: {workspace_dir}")
                 print(f"[SANDBOX] Final workspace path: {workspace_dir}", flush=True)
             except (DiffApplicationError, DiffValidationError, ValueError, OSError) as dae:
@@ -2548,28 +2961,33 @@ class SandboxService:
                     stderr=safe_pe
                 )
 
-            # Pre-flight check for 2D2Mesh workspace integrity
+            # 2D2Mesh note: backend/app/models/ and backend/app/ai/models/ are excluded by the
+            # repository's unanchored `models/` .gitignore rule and were never committed, so they
+            # cannot be authentically restored. This is a documented repository limitation, not a
+            # patch failure, so it must not block validation of the (frontend) fix and the modules
+            # must never be fabricated. Report the gap and continue.
             if "2d2mesh" in repo.lower():
-                from app.services.recovered_2d2mesh_models import verify_2d2mesh_models_present
-                is_complete, missing_mods = verify_2d2mesh_models_present(workspace_dir)
-                if not is_complete:
-                    duration = round(time.time() - start_time, 2)
-                    logger.error(f"[SANDBOX] Mandatory models missing from workspace: {missing_mods}")
-                    print(f"[SANDBOX] Mandatory models missing from workspace: {missing_mods}", flush=True)
-                    return SandboxTestResponse(
-                        success=False,
-                        status="ENVIRONMENT_ERROR",
-                        exit_code=4,
-                        message=f"Preflight validation failed: Missing required modules: {', '.join(missing_mods)}",
-                        working_directory="/workspace/backend",
-                        duration_seconds=duration,
-                        stderr=(
-                            f"PREFLIGHT_ERROR: Target modules missing from workspace:\n"
-                            + "\n".join(f"  - {m}" for m in missing_mods)
-                        )
+                from app.services.recovered_2d2mesh_models import unrecoverable_2d2mesh_model_files
+                missing_mods = [
+                    m for m in unrecoverable_2d2mesh_model_files()
+                    if not os.path.isfile(os.path.join(workspace_dir, m.replace("/", os.sep)))
+                ]
+                if missing_mods:
+                    logger.warning(
+                        f"[SANDBOX] 2D2Mesh backend model packages are absent and unrecoverable "
+                        f"({len(missing_mods)} modules); continuing without fabricating them."
+                    )
+                    print(
+                        f"[SANDBOX] 2D2Mesh backend model packages absent/unrecoverable: "
+                        f"{len(missing_mods)} modules. Continuing (no fabrication).",
+                        flush=True
                     )
 
-            # 5. Detect test command
+            # 5. Detect test command and evaluate formal Test Strategy Contract
+            strategy: Optional[TestStrategyContract] = None
+            test_command, container_workdir, docker_image, framework = None, None, None, None
+
+            # Check detect_test_framework (which callers or unit tests may mock or override)
             try:
                 detect_res = self.detect_test_framework(workspace_dir, files_changed)
                 if isinstance(detect_res, TestFrameworkResult):
@@ -2589,12 +3007,104 @@ class SandboxService:
                             "npm" if "npm" in test_command else
                             test_command
                         )
-                else:
-                    test_command, container_workdir, docker_image, framework = None, None, None, None
             except Exception as fe:
                 safe_fe = _sanitize_error(fe)
                 logger.error(f"[SANDBOX] Test framework detection failed: {safe_fe}", exc_info=True)
                 test_command, container_workdir, docker_image, framework = None, None, None, None
+
+            # Obtain or refine the formal TestStrategyContract via repo_profiler
+            # (bind the evaluation to the verified repository/commit/workspace).
+            repo_identity = {
+                "owner": owner,
+                "repo": repo,
+                "branch": branch,
+                "commit": commit_sha or "unknown",
+                "workspace": workspace_dir,
+            }
+            try:
+                strategy = repo_profiler.evaluate_test_strategy(
+                    workspace_dir, files_changed, repo_identity=repo_identity
+                )
+            except Exception as pe:
+                logger.warning(f"[SANDBOX] Profiler evaluation failed in execute_sandbox_test: {pe}")
+                strategy = None
+
+            if test_command:
+                if not strategy or not strategy.test_command:
+                    clean_fw = framework or "pytest"
+                    strategy = TestStrategyContract(
+                        subproject_path="",
+                        container_workdir=container_workdir or "/workspace",
+                        language="python" if "python" in (docker_image or "") or clean_fw in ("pytest", "unittest") else "javascript",
+                        test_framework=clean_fw,
+                        discovered_test_files=[],
+                        test_files_count=0,
+                        test_command=test_command,
+                        docker_image=docker_image or DEFAULT_PYTHON_IMAGE,
+                        status="READY",
+                        confidence=1.0,
+                        supporting_evidence=[f"Detected test command '{test_command}' via sandbox inspection."]
+                    )
+                else:
+                    test_command = strategy.test_command
+                    container_workdir = strategy.container_workdir
+                    docker_image = strategy.docker_image
+                    framework = strategy.test_framework
+            elif strategy and strategy.test_command:
+                test_command = strategy.test_command
+                container_workdir = strategy.container_workdir
+                docker_image = strategy.docker_image
+                framework = strategy.test_framework
+
+            # Apply manual configuration overrides if specified with strict security validation
+            if working_directory_override is not None:
+                is_valid_workdir, norm_workdir, err_workdir = validate_working_directory_override(working_directory_override)
+                if not is_valid_workdir:
+                    duration = round(time.time() - start_time, 2)
+                    logger.error(f"[SANDBOX] Rejected invalid working directory override: {err_workdir}")
+                    return SandboxTestResponse(
+                        success=False,
+                        status="ENVIRONMENT_ERROR",
+                        message=f"Security violation in working directory override: {err_workdir}",
+                        exit_code=1,
+                        test_command=test_command,
+                        framework=framework,
+                        docker_image=docker_image or DEFAULT_PYTHON_IMAGE,
+                        working_directory=None,
+                        duration_seconds=duration,
+                        stdout="",
+                        stderr=f"Security violation: {err_workdir}",
+                        test_strategy=strategy
+                    )
+                container_workdir = norm_workdir
+                if strategy:
+                    strategy.container_workdir = norm_workdir
+                    strategy.supporting_evidence.append(f"Manual working directory override applied: {norm_workdir}")
+
+            if test_command_override is not None:
+                is_valid_cmd, err_cmd = validate_test_command_override(test_command_override)
+                if not is_valid_cmd:
+                    duration = round(time.time() - start_time, 2)
+                    logger.error(f"[SANDBOX] Rejected invalid test command override: {err_cmd}")
+                    return SandboxTestResponse(
+                        success=False,
+                        status="ENVIRONMENT_ERROR",
+                        message=f"Security violation in test command override: {err_cmd}",
+                        exit_code=1,
+                        test_command=test_command_override,
+                        framework=framework,
+                        docker_image=docker_image or DEFAULT_PYTHON_IMAGE,
+                        working_directory=container_workdir,
+                        duration_seconds=duration,
+                        stdout="",
+                        stderr=f"Security violation: {err_cmd}",
+                        test_strategy=strategy
+                    )
+                test_command = test_command_override.strip()
+                if strategy:
+                    strategy.test_command = test_command
+                    strategy.status = "READY"
+                    strategy.supporting_evidence.append(f"Manual test command override applied: {test_command}")
 
             logger.info(f"[SANDBOX] Detected test framework: framework={framework}, command={test_command}, image={docker_image}, workdir={container_workdir}")
             print(f"[SANDBOX] Detected test framework: framework={framework}, command={test_command}, image={docker_image}, workdir={container_workdir}", flush=True)
@@ -2615,7 +3125,64 @@ class SandboxService:
                     working_directory=container_workdir,
                     duration_seconds=duration,
                     stdout="",
-                    stderr=f"Host workspace path missing: {host_workspace_dir}"
+                    stderr=f"Host workspace path missing: {host_workspace_dir}",
+                    test_strategy=strategy
+                )
+
+            if not test_command:
+                duration = round(time.time() - start_time, 2)
+                if strategy and strategy.status == "UNSUPPORTED_PROJECT":
+                    return SandboxTestResponse(
+                        success=False,
+                        status="UNSUPPORTED_PROJECT",
+                        message="Repository language or build system is unsupported for isolated sandbox execution.",
+                        exit_code=None,
+                        test_command=None,
+                        framework=None,
+                        docker_image=strategy.docker_image,
+                        working_directory=None,
+                        duration_seconds=duration,
+                        stdout="",
+                        stderr="\n".join(strategy.supporting_evidence) or "Unsupported project ecosystem.",
+                        test_strategy=strategy
+                    )
+                # Distinguish "configured suite but zero tests" from "not configured at all"
+                if strategy and strategy.status == "NO_TESTS_FOUND":
+                    return SandboxTestResponse(
+                        success=False,
+                        status="NO_TESTS_FOUND",
+                        message=(
+                            f"Test framework '{strategy.test_framework or 'unknown'}' is configured for "
+                            f"{owner}/{repo}@{branch} but no test files were discovered. "
+                            "Provide a manual test command and working directory override to run tests."
+                        ),
+                        exit_code=None,
+                        test_command=strategy.test_command,
+                        framework=strategy.test_framework,
+                        docker_image=docker_image or DEFAULT_PYTHON_IMAGE,
+                        working_directory=strategy.container_workdir,
+                        duration_seconds=duration,
+                        stdout="",
+                        stderr="\n".join(strategy.supporting_evidence),
+                        test_strategy=strategy
+                    )
+                return SandboxTestResponse(
+                    success=False,
+                    status="TESTS_NOT_CONFIGURED",
+                    message=(
+                        f"No test suite configuration found for {owner}/{repo}@{branch} "
+                        f"(commit {str(commit_sha or 'unknown')[:12]}). "
+                        "Provide a manual test command and working directory override, then rerun."
+                    ),
+                    exit_code=None,
+                    test_command=None,
+                    framework=framework,
+                    docker_image=docker_image or DEFAULT_PYTHON_IMAGE,
+                    working_directory=None,
+                    duration_seconds=duration,
+                    stdout="",
+                    stderr="\n".join(strategy.supporting_evidence) if strategy else "Repository does not define a recognizable test configuration.",
+                    test_strategy=strategy
                 )
 
             # Verify that the selected project directory exists inside the container and host
@@ -2627,29 +3194,14 @@ class SandboxService:
             # Ensure project directory exists on host so it exists inside the container bind mount
             os.makedirs(host_project_dir, exist_ok=True)
 
-            if not test_command:
-                duration = round(time.time() - start_time, 2)
-                return SandboxTestResponse(
-                    success=False,
-                    status="TESTS_NOT_CONFIGURED",
-                    message="No test suite configuration found in the repository.",
-                    exit_code=None,
-                    test_command=None,
-                    framework=None,
-                    docker_image=docker_image or DEFAULT_PYTHON_IMAGE,
-                    working_directory=None,
-                    duration_seconds=duration,
-                    stdout="",
-                    stderr="Repository does not define a recognizable test configuration in package.json or pytest."
-                )
-
             # 6. Phase A: Dependency and Image Preparation (network access permitted)
             docker_image = docker_image or DEFAULT_PYTHON_IMAGE
-            is_node_project = (
-                framework in ("jest", "vitest", "mocha", "npm")
-                or "node" in (docker_image or "").lower()
-                or os.path.isfile(os.path.join(host_project_dir, "package.json"))
+            # The dependency-preparation ecosystem MUST follow the resolved test
+            # framework/image, never the mere presence of a stray manifest.
+            ecosystem = self.classify_dependency_ecosystem(
+                framework, docker_image, host_project_dir
             )
+            is_node_project = ecosystem == "node"
 
             if is_node_project:
                 prep_result = await self.prepare_node_dependencies(
@@ -2675,7 +3227,8 @@ class SandboxService:
                         duration_seconds=duration,
                         stdout=prep_stdout,
                         stderr=prep_stderr,
-                        message=prep_err
+                        message=prep_err,
+                        test_strategy=strategy
                     )
                 docker_image = prep_image
 
@@ -2718,9 +3271,80 @@ class SandboxService:
                         stderr=prep_stderr,
                         message=prep_err,
                         pip_output=pip_full,
-                        pip_output_tail=prep_last_50
+                        pip_output_tail=prep_last_50,
+                        test_strategy=strategy
                     )
                 docker_image = prep_image
+
+            elif framework in ("maven", "gradle", "junit") or "maven" in (docker_image or "").lower() or "gradle" in (docker_image or "").lower():
+                # Phase A: Ensure Java base image is available before isolated execution
+                pulled_ok, pull_err = await self.ensure_base_image_available(docker_image)
+                if not pulled_ok:
+                    duration = round(time.time() - start_time, 2)
+                    logger.warning(f"[SANDBOX] Java runtime image '{docker_image}' unavailable: {pull_err}")
+                    return SandboxTestResponse(
+                        success=False,
+                        status="DEPENDENCIES_UNAVAILABLE",
+                        exit_code=127,
+                        test_command=test_command,
+                        framework=framework,
+                        docker_image=docker_image,
+                        working_directory=container_workdir,
+                        duration_seconds=duration,
+                        stdout="",
+                        stderr=pull_err or f"Container image '{docker_image}' is not cached locally.",
+                        message=(
+                            f"Container image '{docker_image}' is not cached locally and cannot be pulled under network isolation (--network none). "
+                            f"Please pull or cache '{docker_image}' before executing isolated tests."
+                        ),
+                        test_strategy=strategy
+                    )
+
+            elif framework in ("go", "go test") or "golang" in (docker_image or "").lower():
+                pulled_ok, pull_err = await self.ensure_base_image_available(docker_image)
+                if not pulled_ok:
+                    duration = round(time.time() - start_time, 2)
+                    logger.warning(f"[SANDBOX] Go runtime image '{docker_image}' unavailable: {pull_err}")
+                    return SandboxTestResponse(
+                        success=False,
+                        status="DEPENDENCIES_UNAVAILABLE",
+                        exit_code=127,
+                        test_command=test_command,
+                        framework=framework,
+                        docker_image=docker_image,
+                        working_directory=container_workdir,
+                        duration_seconds=duration,
+                        stdout="",
+                        stderr=pull_err or f"Container image '{docker_image}' is not cached locally.",
+                        message=(
+                            f"Container image '{docker_image}' is not cached locally and cannot be pulled under network isolation (--network none). "
+                            f"Please pull or cache '{docker_image}' before executing isolated tests."
+                        ),
+                        test_strategy=strategy
+                    )
+
+            elif framework in ("cargo", "cargo test", "rust") or "rust" in (docker_image or "").lower():
+                pulled_ok, pull_err = await self.ensure_base_image_available(docker_image)
+                if not pulled_ok:
+                    duration = round(time.time() - start_time, 2)
+                    logger.warning(f"[SANDBOX] Rust runtime image '{docker_image}' unavailable: {pull_err}")
+                    return SandboxTestResponse(
+                        success=False,
+                        status="DEPENDENCIES_UNAVAILABLE",
+                        exit_code=127,
+                        test_command=test_command,
+                        framework=framework,
+                        docker_image=docker_image,
+                        working_directory=container_workdir,
+                        duration_seconds=duration,
+                        stdout="",
+                        stderr=pull_err or f"Container image '{docker_image}' is not cached locally.",
+                        message=(
+                            f"Container image '{docker_image}' is not cached locally and cannot be pulled under network isolation (--network none). "
+                            f"Please pull or cache '{docker_image}' before executing isolated tests."
+                        ),
+                        test_strategy=strategy
+                    )
 
             # Verify image availability before Phase B isolated execution
             if not self.check_image_available(docker_image):
@@ -2838,7 +3462,7 @@ class SandboxService:
                     f"echo '=== END PRE-FLIGHT ==='\n"
                     f"{test_command}"
                 )
-            elif framework in ("jest", "vitest", "mocha", "npm") or "node" in (docker_image or "").lower():
+            elif framework in ("jest", "vitest", "mocha", "npm", "node") or "node" in (docker_image or "").lower():
                 runner_script = (
                     "if [ ! -e node_modules ] && [ -d /node_deps/node_modules ]; then\n"
                     "  ln -s /node_deps/node_modules ./node_modules 2>/dev/null || true\n"
@@ -2853,10 +3477,38 @@ class SandboxService:
                     "echo '=== END PRE-FLIGHT ==='\n"
                     f"{test_command}"
                 )
+            elif framework in ("go", "go test") or "golang" in (docker_image or "").lower():
+                runner_script = f"go test -v ./..." if test_command == "go test ./..." else test_command
+            elif framework in ("cargo", "cargo test", "rust") or "rust" in (docker_image or "").lower():
+                runner_script = test_command
             else:
                 runner_script = test_command
 
-            # 7. Execute container with strict security parameters and preferred --mount syntax
+            # 7. Safe Environment Injection: inject non-sensitive dummy environment variables
+            # derived from .env.example / CI configs alongside CI=true, NODE_ENV=test, etc.
+            injected_env_flags: List[str] = []
+            dummy_env_vars: Dict[str, str] = (strategy.dummy_env_vars if strategy and strategy.dummy_env_vars else None) or {
+                "CI": "true",
+                "TESTING": "true",
+                "NODE_ENV": "test",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONUNBUFFERED": "1"
+            }
+            for ek, ev in dummy_env_vars.items():
+                injected_env_flags.extend(["-e", f"{ek}={ev}"])
+
+            # Also synthesize a local .env file in host_project_dir if .env is missing
+            # to support libraries (e.g. dotenv, pydantic-settings) that read disk files
+            synthesized_env_file = os.path.join(host_project_dir, ".env")
+            if not os.path.isfile(synthesized_env_file):
+                try:
+                    with open(synthesized_env_file, "w", encoding="utf-8") as ef:
+                        for ek, ev in dummy_env_vars.items():
+                            ef.write(f"{ek}={ev}\n")
+                except Exception as ee:
+                    logger.debug(f"[SANDBOX] Non-fatal notice writing dummy .env: {ee}")
+
+            # Execute container with strict security parameters and preferred --mount syntax
             host_mount_source = host_workspace_dir.replace("\\", "/")
             docker_cmd = [
                 "docker", "run",
@@ -2868,6 +3520,7 @@ class SandboxService:
                 "--security-opt", "no-new-privileges:true",
                 "--mount", f"type=bind,source={host_mount_source},target=/workspace",
                 "-e", f"PYTHONPATH={python_path_val}",
+                *injected_env_flags,
                 "-w", container_workdir,
                 docker_image,
                 "sh", "-c", runner_script
@@ -3101,13 +3754,80 @@ class SandboxService:
                 or "npm err! could not determine executable to run" in output_combined
             )
 
-            # Check if Pytest or test runner collected 0 tests (e.g. exit code 5)
+            # Check for test collection or runner configuration errors
+            is_collection_error = (
+                exit_code != 0 and (
+                    "configuration error" in output_combined
+                    or "validation error:" in output_combined
+                    or "failed to parse" in output_combined
+                    or "invalid configuration" in output_combined
+                    or ("preset" in output_combined and "not found" in output_combined)
+                    or ("cannot find module" in output_combined and ("jest.config" in output_combined or "ts-jest" in output_combined or "transform" in output_combined or "babel" in output_combined))
+                    or ("syntaxerror" in output_combined and ("jest" in output_combined or "test" in output_combined or "syntax error" in output_combined))
+                    or ("error collecting" in output_combined and not is_env_error)
+                    or ("collection failure" in output_combined and not is_env_error)
+                )
+            )
+
+            if is_collection_error:
+                logger.warning(f"[SANDBOX] Test collection or configuration error in {framework}: exit_code={exit_code}")
+                print(f"[SANDBOX] Test collection or configuration error in {framework}: exit_code={exit_code}", flush=True)
+                err_detail = extract_failure_traceback(stdout, stderr)
+                msg = f"Test collection or configuration error in {framework}:\n{err_detail}" if err_detail else f"Test collection or configuration error: Test runner {framework} failed during configuration or test discovery."
+                return SandboxTestResponse(
+                    success=False,
+                    status="TEST_COLLECTION_ERROR",
+                    exit_code=exit_code,
+                    test_command=test_command,
+                    framework=framework,
+                    docker_image=docker_image,
+                    working_directory=container_workdir,
+                    tests_run=0,
+                    tests_passed=0,
+                    tests_failed=0,
+                    duration_seconds=duration,
+                    total_duration_seconds=total_duration,
+                    stdout=stdout,
+                    stderr=stderr,
+                    message=msg,
+                    test_strategy=strategy
+                )
+
+            # Check if Pytest or test runner collected 0 tests (e.g. exit code 5, "no tests found", "- 0 matches")
             is_no_tests_collected = (
                 exit_code == 5
                 or (exit_code != 0 and "collected 0 items" in output_combined)
                 or (exit_code == 0 and tests_run == 0 and "collected 0 items" in output_combined)
                 or "no tests found" in output_combined
+                or "no test files found" in output_combined
+                or "- 0 matches" in output_combined
+                or "pattern:  - 0 matches" in output_combined
+                or "--passwithnotests" in output_combined
+                or (tests_run == 0 and (tests_failed or 0) == 0 and (tests_passed or 0) == 0)
             )
+
+            # Prioritize zero-tests detection over generic missing dependency/runner checks
+            if is_no_tests_collected:
+                logger.info(f"[SANDBOX] No matching tests found by {framework} (exit_code={exit_code})")
+                print(f"[SANDBOX] No matching tests found by {framework} (exit_code={exit_code})", flush=True)
+                return SandboxTestResponse(
+                    success=False,
+                    status="NO_TESTS_FOUND",
+                    exit_code=exit_code,
+                    test_command=test_command,
+                    framework=framework,
+                    docker_image=docker_image,
+                    working_directory=container_workdir,
+                    tests_run=0,
+                    tests_passed=0,
+                    tests_failed=0,
+                    duration_seconds=duration,
+                    total_duration_seconds=total_duration,
+                    stdout=stdout,
+                    stderr=stderr,
+                    message=f"No matching test files found: Test runner {framework} executed but found zero test files matching pattern.",
+                    test_strategy=strategy
+                )
 
             if exit_code != 0 and (is_runner_missing or is_dep_missing):
                 logger.warning(f"[SANDBOX] Dependencies unavailable in isolated sandbox: exit_code={exit_code}")
@@ -3133,38 +3853,18 @@ class SandboxService:
                     total_duration_seconds=total_duration,
                     stdout=stdout,
                     stderr=stderr,
-                    message=msg
-                )
-
-            if is_no_tests_collected:
-                logger.info(f"[SANDBOX] No tests collected by {framework}")
-                print(f"[SANDBOX] No tests collected by {framework}", flush=True)
-                return SandboxTestResponse(
-                    success=False,
-                    status="TESTS_NOT_CONFIGURED",
-                    exit_code=exit_code,
-                    test_command=test_command,
-                    framework=framework,
-                    docker_image=docker_image,
-                    working_directory=container_workdir,
-                    tests_run=0,
-                    tests_passed=0,
-                    tests_failed=0,
-                    duration_seconds=duration,
-                    total_duration_seconds=total_duration,
-                    stdout=stdout,
-                    stderr=stderr,
-                    message=f"Test runner {framework} executed but no test files or cases were collected."
+                    message=msg,
+                    test_strategy=strategy
                 )
 
             if exit_code == 0:
                 # Mandatory: Zero tests executed must never be treated as success
-                if is_no_tests_collected or (tests_run is not None and tests_run == 0) or (tests_passed is not None and tests_passed == 0 and (tests_failed or 0) == 0 and tests_run is not None):
-                    logger.info(f"[SANDBOX] Exit code 0 but zero tests run ({tests_run})")
-                    print(f"[SANDBOX] Exit code 0 but zero tests run ({tests_run})", flush=True)
+                if is_no_tests_collected or not (tests_run and tests_run > 0 and tests_passed and tests_passed > 0 and (tests_failed or 0) == 0):
+                    logger.info(f"[SANDBOX] Exit code 0 but zero tests run or passed (run={tests_run}, passed={tests_passed})")
+                    print(f"[SANDBOX] Exit code 0 but zero tests run or passed (run={tests_run}, passed={tests_passed})", flush=True)
                     return SandboxTestResponse(
                         success=False,
-                        status="TESTS_NOT_CONFIGURED",
+                        status="NO_TESTS_FOUND",
                         exit_code=0,
                         test_command=test_command,
                         framework=framework,
@@ -3177,11 +3877,15 @@ class SandboxService:
                         total_duration_seconds=total_duration,
                         stdout=stdout,
                         stderr=stderr,
-                        message=f"Test runner {framework} exited with code 0 but zero tests were executed."
+                        message=f"Test runner {framework} exited with code 0 but zero tests were executed.",
+                        test_strategy=strategy
                     )
 
-                logger.info(f"[SANDBOX] Tests PASSED in {duration}s")
-                print(f"[SANDBOX] Tests PASSED in {duration}s", flush=True)
+                passed_msg = "All tests passed successfully in Docker sandbox."
+                if has_synthesized_test:
+                    passed_msg += " (verified via AI-synthesized unit test)"
+                logger.info(f"[SANDBOX] Tests PASSED in {duration}s" + (" [Verified via Synthesized Test]" if has_synthesized_test else ""))
+                print(f"[SANDBOX] Tests PASSED in {duration}s" + (" [Verified via Synthesized Test]" if has_synthesized_test else ""), flush=True)
                 return SandboxTestResponse(
                     success=True,
                     status="PASSED",
@@ -3197,7 +3901,10 @@ class SandboxService:
                     total_duration_seconds=total_duration,
                     stdout=stdout,
                     stderr=stderr,
-                    message="All tests passed successfully in Docker sandbox."
+                    message=passed_msg,
+                    test_strategy=strategy,
+                    verified_via_synthesized_test=has_synthesized_test,
+                    base_commit=commit_sha or None
                 )
             else:
                 logger.warning(f"[SANDBOX] Tests FAILED with exit code {exit_code}")
@@ -3217,7 +3924,9 @@ class SandboxService:
                     total_duration_seconds=total_duration,
                     stdout=stdout,
                     stderr=stderr,
-                    message=f"Test execution failed with exit code {exit_code}."
+                    message=f"Test execution failed with exit code {exit_code}.",
+                    test_strategy=strategy,
+                    base_commit=commit_sha or None
                 )
 
         finally:

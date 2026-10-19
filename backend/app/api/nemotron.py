@@ -255,15 +255,56 @@ async def generate_patch(payload: NemotronGeneratePatchRequest):
         )
         return result
     except ValueError as ve:
+        # Includes NemotronResponseError (malformed/invalid model output) -> client-side 400.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=_sanitize_error(ve)
         )
+    except NemotronTimeoutError as te:
+        logger.error(f"[GENERATE_PATCH] Nemotron timeout: {te}")
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={
+                "error": "gateway_timeout",
+                "error_code": "NEMOTRON_TIMEOUT",
+                "message": _sanitize_error(te),
+                "correlation_id": getattr(te, "correlation_id", None)
+            }
+        )
+    except NemotronRateLimitError as rle:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": "rate_limited",
+                "error_code": "NEMOTRON_RATE_LIMITED",
+                "message": _sanitize_error(rle),
+                "correlation_id": getattr(rle, "correlation_id", None)
+            }
+        )
+    except NemotronAuthError as nae:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "error": "unauthorized",
+                "error_code": "NEMOTRON_AUTH_ERROR",
+                "message": _sanitize_error(nae),
+                "correlation_id": getattr(nae, "correlation_id", None)
+            }
+        )
+    except NemotronAPIError as be:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error": "bad_gateway",
+                "error_code": "NEMOTRON_API_ERROR",
+                "message": _sanitize_error(be),
+                "correlation_id": getattr(be, "correlation_id", None)
+            }
+        )
     except Exception as e:
         safe_msg = _sanitize_error(e)
-        status_code = status.HTTP_503_SERVICE_UNAVAILABLE if "rate limit" in safe_msg.lower() or "timeout" in safe_msg.lower() else status.HTTP_500_INTERNAL_SERVER_ERROR
         raise HTTPException(
-            status_code=status_code,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Patch generation failed: {safe_msg}"
         )
 
@@ -322,14 +363,25 @@ async def generate_real_patch(payload: NemotronPatchRequest, request: Request):
         print(f"[PATCH] Timeout error: {te}", flush=True)
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail={"error": "gateway_timeout", "message": _sanitize_error(te)}
+            detail={
+                "error": "gateway_timeout",
+                "error_code": "GITHUB_TIMEOUT" if isinstance(te, GitHubTimeoutError) else "NEMOTRON_TIMEOUT",
+                "message": _sanitize_error(te),
+                "retry_available": True,
+                "correlation_id": getattr(te, "correlation_id", None)
+            }
         )
     except (GitHubConnectionError, NemotronAPIError, NemotronResponseError) as be:
         logger.error(f"[PATCH] Upstream error: {be}")
         print(f"[PATCH] Upstream error: {be}", flush=True)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail={"error": "bad_gateway", "message": _sanitize_error(be)}
+            detail={
+                "error": "bad_gateway",
+                "error_code": "GITHUB_CONNECTION_ERROR" if isinstance(be, GitHubConnectionError) else "NEMOTRON_API_ERROR",
+                "message": _sanitize_error(be),
+                "correlation_id": getattr(be, "correlation_id", None)
+            }
         )
     except (GitHubAuthError, GitHubRateLimitError, GitHubNotFoundError, GitHubError) as ge:
         logger.error(f"[PATCH] GitHub error: {ge}")

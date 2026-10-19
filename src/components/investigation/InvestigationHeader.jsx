@@ -6,6 +6,7 @@ export default function InvestigationHeader({
   inv,
   isComplete,
   isStopped,
+  isFailed = false,
   isRealMode = false,
   isInvestigating = false,
   onFastForward,
@@ -37,11 +38,11 @@ export default function InvestigationHeader({
             <span className={`text-[10px] font-mono font-bold uppercase px-2 py-0.5 rounded border ${
               inv.status === 'COMPLETE' || inv.status === 'READY_FOR_REVIEW'
                 ? 'bg-[#F0FDF4] text-[#16A34A] border-[#BBF7D0]'
-                : inv.status === 'FAILED' || inv.status === 'ENVIRONMENT_ERROR'
+                : inv.status === 'FAILED' || inv.status === 'ENVIRONMENT_ERROR' || isFailed
                 ? 'bg-[#FEF2F2] text-[#DC2626] border-[#FECACA]'
                 : 'bg-[#EFF6FF] text-[#2563EB] border-[#BFDBFE]'
             }`}>
-              {inv.status}
+              {isFailed && inv.status !== 'FAILED' ? 'FAILED' : inv.status}
             </span>
           )}
           {isReal ? (
@@ -101,6 +102,10 @@ export default function InvestigationHeader({
           <span className="text-xs font-semibold text-[#DC2626] bg-[#FEE2E2] px-3 py-1.5 rounded-lg border border-[#FECACA]">
             Investigation Aborted
           </span>
+        ) : isFailed ? (
+          <span className="text-xs font-semibold text-[#DC2626] bg-[#FEE2E2] px-3 py-1.5 rounded-lg border border-[#FECACA]">
+            Investigation Failed
+          </span>
         ) : (
           <div className="flex items-center gap-2">
             {!isReal && (
@@ -119,6 +124,7 @@ export default function InvestigationHeader({
               size="sm"
               icon={StopCircle}
               onClick={onStopClick}
+              disabled={isInvestigating}
             >
               Stop
             </Button>

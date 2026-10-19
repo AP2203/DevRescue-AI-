@@ -462,19 +462,19 @@ async def test_patch_service_supports_new_file_creation():
 
     new_file_diff = (
         "--- /dev/null\n"
-        "+++ b/backend/app/models/enums.py\n"
+        "+++ b/backend/app/services/pipeline_state.py\n"
         "@@ -0,0 +1,5 @@\n"
         "+from enum import Enum\n"
         "+\n"
-        "+class JobStatus(str, Enum):\n"
+        "+class PipelineState(str, Enum):\n"
         "+    QUEUED = 'queued'\n"
     )
 
     investigation = {
-        "root_cause": "Module backend/app/models/enums.py was missing from repository.",
+        "root_cause": "Module backend/app/services/pipeline_state.py was missing from repository.",
         "confidence": 0.98,
-        "affected_files": ["backend/app/models/enums.py"],
-        "proposed_fix": "Create backend/app/models/enums.py defining JobStatus enum."
+        "affected_files": ["backend/app/services/pipeline_state.py"],
+        "proposed_fix": "Create backend/app/services/pipeline_state.py defining PipelineState enum."
     }
 
     with patch("app.services.patch_service.github_service.get_file_content_and_sha", new_callable=AsyncMock) as mock_get_file, \
@@ -499,8 +499,8 @@ async def test_patch_service_supports_new_file_creation():
         )
 
         assert res["success"] is True
-        assert "backend/app/models/enums.py" in res["files_changed"]
-        assert "JobStatus" in res["patch"]
+        assert "backend/app/services/pipeline_state.py" in res["files_changed"]
+        assert "PipelineState" in res["patch"]
 
 
 

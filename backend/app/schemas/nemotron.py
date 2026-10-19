@@ -79,6 +79,7 @@ class NemotronPatchResponse(BaseModel):
     changed_files: List[str] = Field(default_factory=list)
     explanation: str
     test_plan: str
+    binding: Dict[str, Any] = Field(default_factory=dict)
 
 class NemotronPatchRequest(BaseModel):
     owner: str = Field(..., description="GitHub repository owner", json_schema_extra={"example": "anshpatel2212"})
@@ -104,4 +105,6 @@ class NemotronRealPatchResponse(BaseModel):
     file_shas: Dict[str, str] = Field(default_factory=dict)
     source_hashes: Dict[str, str] = Field(default_factory=dict)
     retries_used: int = 0
+    synthesized_test_included: bool = Field(False, description="Whether patch includes an AI-synthesized unit test")
+    binding: Dict[str, Any] = Field(default_factory=dict, description="Provenance binding: investigation/run/repo/base commit/patch SHA-256")
 

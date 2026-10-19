@@ -51,7 +51,6 @@ export default function SecurityResults({ isRealMode = false, securityResult = n
 
     const isPassed = securityResult.status === 'PASSED';
     const isWarnings = securityResult.status === 'WARNINGS';
-    const isFailed = securityResult.status === 'FAILED';
 
     const statusBadge = isPassed ? (
       <span className="text-xs font-bold text-[#16A34A] bg-[#DCFCE7] border border-[#86EFAC] px-2.5 py-1 rounded-full flex items-center gap-1.5">

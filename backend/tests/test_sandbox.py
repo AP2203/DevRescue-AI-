@@ -15,6 +15,7 @@ from app.services.sandbox_service import (
     normalize_container_path,
     flatten_nested_root_folder,
     PrepDependenciesResult,
+    TestFrameworkResult,
 )
 from app.services.diff_validator import DiffApplicationError
 from app.services.session_store import session_store
@@ -435,7 +436,7 @@ async def test_execution_pytest_no_tests_collected_code_5():
                             patch="--- a/app.py\n+++ b/app.py\n@@ -1,1 +1,1 @@\n-a\n+b\n"
                         )
                         assert res.success is False
-                        assert res.status == "TESTS_NOT_CONFIGURED"
+                        assert res.status in ("NO_TESTS_FOUND", "TESTS_NOT_CONFIGURED")
                         assert res.exit_code == 5
 
 
@@ -3058,6 +3059,392 @@ def test_detect_node_runtime_version_variants(tmp_path):
     d3.mkdir()
     (d3 / "package.json").write_text(json.dumps({"engines": {"node": ">=18.0.0"}}), encoding="utf-8")
     assert service.detect_node_runtime_version(str(d3)) == ("18", "node:18-slim")
+
+
+# -------------------------------------------------------------
+# 16. Jest Test Discovery and Zero-Test Classification Tests
+# -------------------------------------------------------------
+
+def test_parse_test_metrics_jest_zero_tests():
+    """Verifies that Jest 'No tests found' output is parsed as 0 run, 0 passed, 0 failed."""
+    jest_zero_stdout = ""
+    jest_zero_stderr = """
+> smart-city-aqi-backend@1.0.0 test
+> jest
+
+No tests found, exiting with code 1
+Run with `--passWithNoTests` to exit with code 0
+In /workspace/smart-city-air-quality/backend
+  168 files checked.
+  testMatch: **/__tests__/**/*.[jt]s?(x), **/?(*.)+(spec|test).[tj]s?(x) - 0 matches
+  testPathIgnorePatterns: \\node_modules\\ - 168 matches
+  testRegex:  - 0 matches
+Pattern:  - 0 matches
+"""
+    total, passed, failed = parse_test_metrics("npm test", jest_zero_stdout, jest_zero_stderr)
+    assert total == 0
+    assert passed == 0
+    assert failed == 0
+
+
+def test_parse_test_metrics_jest_passing():
+    """Verifies that Jest passing output is parsed with accurate metrics."""
+    jest_pass_stdout = """
+PASS src/utils/aqiCalculator.test.ts
+  AQI Calculator Utility
+    √ calculates Good AQI for low PM2.5 (3 ms)
+    √ calculates Severe AQI for dangerous PM2.5 (1 ms)
+
+Test Suites: 1 passed, 1 total
+Tests:       2 passed, 2 total
+Snapshots:   0 total
+Time:        3.45 s
+"""
+    total, passed, failed = parse_test_metrics("npm test", jest_pass_stdout, "")
+    assert total == 2
+    assert passed == 2
+    assert failed == 0
+
+
+def test_parse_test_metrics_jest_failing():
+    """Verifies that Jest failing output correctly extracts total, passed, and failed counts."""
+    jest_fail_stdout = """
+FAIL src/utils/aqiCalculator.test.ts
+  ● calculates Good AQI
+
+Test Suites: 1 failed, 1 total
+Tests:       1 failed, 4 passed, 5 total
+Snapshots:   0 total
+Time:        4.12 s
+"""
+    total, passed, failed = parse_test_metrics("npm test", jest_fail_stdout, "")
+    assert total == 5
+    assert passed == 4
+    assert failed == 1
+
+
+@pytest.mark.asyncio
+async def test_jest_zero_tests_classified_as_no_tests_found():
+    """Verifies that Jest exit code 1 with zero test files is classified as NO_TESTS_FOUND."""
+    service = SandboxService()
+    zero_test_output = """
+No tests found, exiting with code 1
+Run with `--passWithNoTests` to exit with code 0
+  testMatch: **/__tests__/**/*.[jt]s?(x), **/?(*.)+(spec|test).[tj]s?(x) - 0 matches
+Pattern:  - 0 matches
+"""
+    valid_patch = "--- a/backend/src/utils/aqiCalculator.ts\n+++ b/backend/src/utils/aqiCalculator.ts\n@@ -1,1 +1,1 @@\n"
+    mock_exec = AsyncMock(return_value=(1, "", zero_test_output))
+
+    with patch.object(service, "check_docker_available", return_value=(True, None)), \
+         patch.object(service, "check_image_available", return_value=True), \
+         patch("app.services.github_service.github_service.download_and_extract_archive", new_callable=AsyncMock), \
+         patch.object(service, "apply_patch_to_workspace", return_value=["backend/src/utils/aqiCalculator.ts"]), \
+         patch.object(service, "detect_test_framework", return_value=TestFrameworkResult("npm test", "/workspace/backend", "node:20-slim", "jest")), \
+         patch.object(service, "prepare_project_dependencies", new_callable=AsyncMock, return_value=("node:20-slim", None)), \
+         patch.object(service, "_execute_docker_cmd", mock_exec):
+
+        res = await service.execute_sandbox_test(
+            owner="test",
+            repo="smart-city-air-quality",
+            branch="main",
+            issue_number=1,
+            patch=valid_patch
+        )
+
+        assert res.success is False
+        assert res.status == "NO_TESTS_FOUND"
+        assert res.tests_run == 0
+        assert res.tests_passed == 0
+        assert res.tests_failed == 0
+        assert res.exit_code == 1
+        assert "no matching test files" in (res.message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_jest_pass_with_no_tests_cannot_produce_passed_status():
+    """Verifies that even if Jest exits with code 0 via --passWithNoTests or 0 tests run, status is NO_TESTS_FOUND, never PASSED."""
+    service = SandboxService()
+    pass_with_no_tests_output = """
+No tests found related to files changed since last commit.
+Run with `--passWithNoTests` to exit with code 0
+Ran all test suites.
+"""
+    valid_patch = "--- a/backend/src/utils/aqiCalculator.ts\n+++ b/backend/src/utils/aqiCalculator.ts\n@@ -1,1 +1,1 @@\n"
+    mock_exec = AsyncMock(return_value=(0, pass_with_no_tests_output, ""))
+
+    with patch.object(service, "check_docker_available", return_value=(True, None)), \
+         patch.object(service, "check_image_available", return_value=True), \
+         patch("app.services.github_service.github_service.download_and_extract_archive", new_callable=AsyncMock), \
+         patch.object(service, "apply_patch_to_workspace", return_value=["backend/src/utils/aqiCalculator.ts"]), \
+         patch.object(service, "detect_test_framework", return_value=TestFrameworkResult("npm test", "/workspace/backend", "node:20-slim", "jest")), \
+         patch.object(service, "prepare_project_dependencies", new_callable=AsyncMock, return_value=("node:20-slim", None)), \
+         patch.object(service, "_execute_docker_cmd", mock_exec):
+
+        res = await service.execute_sandbox_test(
+            owner="test",
+            repo="smart-city-air-quality",
+            branch="main",
+            issue_number=1,
+            patch=valid_patch
+        )
+
+        # Invariant: status must NEVER be PASSED when tests_run == 0
+        assert res.success is False
+        assert res.status == "NO_TESTS_FOUND"
+        assert res.tests_run == 0
+
+
+@pytest.mark.asyncio
+async def test_jest_passing_execution_returns_passed_status():
+    """Verifies that valid Jest execution with passing assertions returns status PASSED and accurate metrics."""
+    service = SandboxService()
+    pass_output = """
+PASS src/utils/aqiCalculator.test.ts (1.234 s)
+  AQI Calculator Utility
+    √ calculates Good AQI (3 ms)
+    √ calculates Moderate AQI (1 ms)
+
+Test Suites: 1 passed, 1 total
+Tests:       5 passed, 5 total
+Snapshots:   0 total
+Time:        2.34 s
+"""
+    valid_patch = "--- a/backend/src/utils/aqiCalculator.ts\n+++ b/backend/src/utils/aqiCalculator.ts\n@@ -1,1 +1,1 @@\n"
+    mock_exec = AsyncMock(return_value=(0, pass_output, ""))
+
+    with patch.object(service, "check_docker_available", return_value=(True, None)), \
+         patch.object(service, "check_image_available", return_value=True), \
+         patch("app.services.github_service.github_service.download_and_extract_archive", new_callable=AsyncMock), \
+         patch.object(service, "apply_patch_to_workspace", return_value=["backend/src/utils/aqiCalculator.ts"]), \
+         patch.object(service, "detect_test_framework", return_value=TestFrameworkResult("npm test", "/workspace/backend", "node:20-slim", "jest")), \
+         patch.object(service, "prepare_project_dependencies", new_callable=AsyncMock, return_value=("node:20-slim", None)), \
+         patch.object(service, "_execute_docker_cmd", mock_exec):
+
+        res = await service.execute_sandbox_test(
+            owner="test",
+            repo="smart-city-air-quality",
+            branch="main",
+            issue_number=1,
+            patch=valid_patch
+        )
+
+        assert res.success is True
+        assert res.status == "PASSED"
+        assert res.tests_run == 5
+        assert res.tests_passed == 5
+        assert res.tests_failed == 0
+        assert res.exit_code == 0
+        assert res.duration_seconds == 2.34
+
+
+@pytest.mark.asyncio
+async def test_jest_failing_execution_returns_failed_status():
+    """Verifies that Jest execution with failing assertions returns status FAILED."""
+    service = SandboxService()
+    fail_output = """
+FAIL src/utils/aqiCalculator.test.ts
+  ● AQI Calculator Utility › calculates Good AQI
+    expect(received).toBe(expected)
+
+Test Suites: 1 failed, 1 total
+Tests:       1 failed, 4 passed, 5 total
+Snapshots:   0 total
+Time:        2.50 s
+"""
+    valid_patch = "--- a/backend/src/utils/aqiCalculator.ts\n+++ b/backend/src/utils/aqiCalculator.ts\n@@ -1,1 +1,1 @@\n"
+    mock_exec = AsyncMock(return_value=(1, fail_output, ""))
+
+    with patch.object(service, "check_docker_available", return_value=(True, None)), \
+         patch.object(service, "check_image_available", return_value=True), \
+         patch("app.services.github_service.github_service.download_and_extract_archive", new_callable=AsyncMock), \
+         patch.object(service, "apply_patch_to_workspace", return_value=["backend/src/utils/aqiCalculator.ts"]), \
+         patch.object(service, "detect_test_framework", return_value=TestFrameworkResult("npm test", "/workspace/backend", "node:20-slim", "jest")), \
+         patch.object(service, "prepare_project_dependencies", new_callable=AsyncMock, return_value=("node:20-slim", None)), \
+         patch.object(service, "_execute_docker_cmd", mock_exec):
+
+        res = await service.execute_sandbox_test(
+            owner="test",
+            repo="smart-city-air-quality",
+            branch="main",
+            issue_number=1,
+            patch=valid_patch
+        )
+
+        assert res.success is False
+        assert res.status == "FAILED"
+        assert res.tests_run == 5
+        assert res.tests_passed == 4
+        assert res.tests_failed == 1
+        assert res.exit_code == 1
+
+
+@pytest.mark.asyncio
+async def test_jest_invalid_configuration_classified_as_test_collection_error():
+    """Verifies that invalid Jest configuration is classified as TEST_COLLECTION_ERROR, not FAILED or DEPENDENCIES_UNAVAILABLE."""
+    service = SandboxService()
+    config_err_output = """
+● Validation Error:
+
+  Module ts-jest in the transform option was not found.
+         <rootDir>/jest.config.js
+
+  Configuration error: Invalid transform module configuration.
+"""
+    valid_patch = "--- a/backend/src/utils/aqiCalculator.ts\n+++ b/backend/src/utils/aqiCalculator.ts\n@@ -1,1 +1,1 @@\n"
+    mock_exec = AsyncMock(return_value=(1, "", config_err_output))
+
+    with patch.object(service, "check_docker_available", return_value=(True, None)), \
+         patch.object(service, "check_image_available", return_value=True), \
+         patch("app.services.github_service.github_service.download_and_extract_archive", new_callable=AsyncMock), \
+         patch.object(service, "apply_patch_to_workspace", return_value=["backend/src/utils/aqiCalculator.ts"]), \
+         patch.object(service, "detect_test_framework", return_value=TestFrameworkResult("npm test", "/workspace/backend", "node:20-slim", "jest")), \
+         patch.object(service, "prepare_project_dependencies", new_callable=AsyncMock, return_value=("node:20-slim", None)), \
+         patch.object(service, "_execute_docker_cmd", mock_exec):
+
+        res = await service.execute_sandbox_test(
+            owner="test",
+            repo="smart-city-air-quality",
+            branch="main",
+            issue_number=1,
+            patch=valid_patch
+        )
+
+        assert res.success is False
+        assert res.status == "TEST_COLLECTION_ERROR"
+        assert res.exit_code == 1
+        assert "configuration error" in (res.message or "").lower()
+
+
+def test_jest_nested_directory_framework_detection(tmp_path):
+    """Verifies that detect_test_framework correctly discovers nested backend directory and configures workdir."""
+    service = SandboxService()
+    root_pkg = tmp_path / "package.json"
+    root_pkg.write_text(json.dumps({"name": "monorepo", "scripts": {"dev": "npm start"}}), encoding="utf-8")
+
+    backend_dir = tmp_path / "backend"
+    backend_dir.mkdir()
+    backend_pkg = backend_dir / "package.json"
+    backend_pkg.write_text(json.dumps({
+        "name": "backend",
+        "scripts": {"test": "jest"},
+        "devDependencies": {"jest": "^29.0.0"}
+    }), encoding="utf-8")
+
+    res = service.detect_test_framework(str(tmp_path), ["backend/src/index.ts"])
+    assert res.framework == "jest"
+    assert res.command == "npm test"
+    assert res.workdir == "/workspace/backend"
+
+
+# -------------------------------------------------------------
+# 28. Polyglot Metrics, Go, Rust, and Unsupported Project Tests
+# -------------------------------------------------------------
+
+def test_parse_test_metrics_rust():
+    """Verifies that parse_test_metrics accurately parses cargo test summary lines."""
+    rust_pass_out = (
+        "running 5 tests\n"
+        "test tests::test_add ... ok\n"
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s\n"
+    )
+    total, passed, failed = parse_test_metrics("cargo test", rust_pass_out)
+    assert total == 5
+    assert passed == 5
+    assert failed == 0
+
+    rust_fail_out = (
+        "running 4 tests\n"
+        "test tests::test_add ... ok\n"
+        "test tests::test_sub ... FAILED\n"
+        "test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s\n"
+    )
+    total, passed, failed = parse_test_metrics("cargo test", rust_fail_out)
+    assert total == 4
+    assert passed == 3
+    assert failed == 1
+
+
+def test_parse_test_metrics_go():
+    """Verifies that parse_test_metrics accurately parses go test output."""
+    go_pass_out = (
+        "=== RUN   TestAdd\n"
+        "--- PASS: TestAdd (0.00s)\n"
+        "=== RUN   TestSubtract\n"
+        "--- PASS: TestSubtract (0.00s)\n"
+        "PASS\n"
+        "ok  \tgithub.com/example/calc\t0.005s\n"
+    )
+    total, passed, failed = parse_test_metrics("go test ./...", go_pass_out)
+    assert total == 2
+    assert passed == 2
+    assert failed == 0
+
+    go_fail_out = (
+        "=== RUN   TestAdd\n"
+        "--- PASS: TestAdd (0.00s)\n"
+        "=== RUN   TestSubtract\n"
+        "--- FAIL: TestSubtract (0.01s)\n"
+        "FAIL\n"
+        "FAIL\tgithub.com/example/calc\t0.015s\n"
+    )
+    total, passed, failed = parse_test_metrics("go test ./...", go_fail_out)
+    assert total == 2
+    assert passed == 1
+    assert failed == 1
+
+    go_zero_tests = "?   \tgithub.com/example/empty\t[no test files]\n"
+    total, passed, failed = parse_test_metrics("go test ./...", go_zero_tests)
+    assert total == 0
+    assert passed == 0
+def test_parse_test_duration_polyglot():
+    """Verifies test duration parsing across Rust and Go."""
+    from app.services.sandbox_service import parse_test_duration
+    rust_out = "test result: ok. 5 passed; finished in 0.12s\n"
+    dur = parse_test_duration("cargo test", rust_out)
+    assert dur == 0.12
+
+    go_out = "ok  \tgithub.com/example/api\t0.45s\n"
+    dur = parse_test_duration("go test ./...", go_out)
+    assert dur == 0.45
+
+
+@pytest.mark.asyncio
+async def test_execute_sandbox_test_unsupported_project(tmp_path):
+    """Verifies that a repository with an unsupported language returns UNSUPPORTED_PROJECT."""
+    service = SandboxService()
+    valid_patch = (
+        "--- a/main.c\n"
+        "+++ b/main.c\n"
+        "@@ -1,1 +1,2 @@\n"
+        "+#include <stdlib.h>\n"
+        " #include <stdio.h>\n"
+    )
+
+    async def mock_download(access_token, owner, repo, ref, destination_dir):
+        with open(os.path.join(destination_dir, "main.c"), "w", encoding="utf-8") as f:
+            f.write("#include <stdio.h>\nint main() { return 0; }\n")
+
+    with patch("app.services.github_service.github_service.download_and_extract_archive", mock_download), \
+         patch.object(service, "check_docker_available", return_value=(True, None)), \
+         patch.object(service, "apply_patch_to_workspace", return_value=["main.c"]):
+
+        res = await service.execute_sandbox_test(
+            owner="c_owner",
+            repo="c_repo",
+            branch="main",
+            issue_number=1,
+            patch=valid_patch
+        )
+
+        assert res.success is False
+        assert res.status == "UNSUPPORTED_PROJECT"
+        assert res.test_strategy is not None
+        assert res.test_strategy.status == "UNSUPPORTED_PROJECT"
+        assert "unsupported" in (res.message or "").lower()
+
+
+
 
 
 

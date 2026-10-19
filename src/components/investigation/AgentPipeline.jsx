@@ -27,11 +27,21 @@ export default function AgentPipeline({
       return 'NOT IMPLEMENTED';
     }
 
+    if (status === 'SKIPPED' || status === 'TESTS_NOT_CONFIGURED' || status === 'NO_TESTS_FOUND' || status === 'UNSUPPORTED_PROJECT') {
+      if (step === 4) return status === 'UNSUPPORTED_PROJECT' ? 'Unsupported project ecosystem' : 'No test suite configured or collected';
+      return 'Stage skipped';
+    }
+
     if (status === 'COMPLETE' || status === 'PASSED') {
       if (step === 1) return 'AST dependency graph analyzed';
       if (step === 2) return 'Bug isolated in code graph';
       if (step === 3) return 'Patch synthesized';
-      if (step === 4) return isRealMode ? 'Docker sandbox tests passed' : 'Simulated tests passed';
+      if (step === 4) {
+        if (sandboxResult?.verified_via_synthesized_test || sandboxResult?.verifiedViaSynthesizedTest || agent.details?.verified_via_synthesized_test) {
+          return 'Docker sandbox verified via AI-synthesized test';
+        }
+        return isRealMode ? 'Docker sandbox tests passed' : 'Simulated tests passed';
+      }
       if (step === 5) return isRealMode ? 'Security audit passed' : 'Simulated audit passed';
       return 'Completed';
     }
@@ -67,6 +77,7 @@ export default function AgentPipeline({
           {agents.map((agent, idx) => {
             const isAgentPassed = agent.status === 'COMPLETE' || agent.status === 'PASSED';
             const isAgentWarning = agent.status === 'WARNING' || agent.status === 'WARNINGS';
+            const isAgentSkipped = agent.status === 'SKIPPED' || agent.status === 'TESTS_NOT_CONFIGURED' || agent.status === 'NO_TESTS_FOUND' || agent.status === 'UNSUPPORTED_PROJECT';
             const isAgentActive = agent.status === 'IN_PROGRESS' || agent.status === 'RUNNING';
             const isAgentNotImpl = agent.status === 'NOT_IMPLEMENTED';
             const isAgentFailed = agent.status === 'FAILED' || agent.status === 'TESTS_FAILED' || agent.status === 'ENVIRONMENT_ERROR' || agent.status === 'DEPENDENCIES_UNAVAILABLE' || agent.status === 'PATCH_FAILED' || agent.status === 'ERROR';
@@ -81,6 +92,8 @@ export default function AgentPipeline({
                     : isAgentPassed
                     ? 'bg-[#F8FAFC] border-[#E2E8F0]'
                     : isAgentWarning
+                    ? 'bg-[#FFFBEB] border-[#FDE68A]'
+                    : isAgentSkipped
                     ? 'bg-[#FFFBEB] border-[#FDE68A]'
                     : isAgentNotImpl
                     ? 'bg-[#F8FAFC] border-[#E2E8F0] opacity-75'
@@ -101,6 +114,11 @@ export default function AgentPipeline({
                           !
                         </div>
                       )}
+                      {isAgentSkipped && (
+                        <div className="w-5 h-5 rounded-full bg-[#FEF3C7] text-[#D97706] flex items-center justify-center font-bold text-xs">
+                          —
+                        </div>
+                      )}
                       {isAgentActive && (
                         <div className="relative w-5 h-5 rounded-full bg-[#EFF6FF] text-[#2563EB] flex items-center justify-center border border-[#2563EB]">
                           <span className="w-2 h-2 rounded-full bg-[#2563EB] animate-ping" />
@@ -117,7 +135,7 @@ export default function AgentPipeline({
                           ✕
                         </div>
                       )}
-                      {!isAgentPassed && !isAgentWarning && !isAgentActive && !isAgentNotImpl && !isAgentFailed && (
+                      {!isAgentPassed && !isAgentWarning && !isAgentSkipped && !isAgentActive && !isAgentNotImpl && !isAgentFailed && (
                         <div className="w-5 h-5 rounded-full border border-slate-300 text-slate-400 flex items-center justify-center font-mono text-[10px]">
                           ○
                         </div>
@@ -139,24 +157,33 @@ export default function AgentPipeline({
                     </div>
                   </div>
 
-                  <div className="text-right">
-                    <span
-                      className={`text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full ${
-                        isAgentPassed
-                          ? 'bg-[#DCFCE7] text-[#16A34A]'
-                          : isAgentWarning
-                          ? 'bg-[#FEF3C7] text-[#D97706] border border-[#FCD34D]'
-                          : isAgentFailed
-                          ? 'bg-[#FEE2E2] text-[#DC2626] font-bold border border-[#FCA5A5]'
-                          : isAgentActive
-                          ? 'bg-[#DBEAFE] text-[#2563EB]'
-                          : isAgentNotImpl
-                          ? 'bg-slate-100 text-slate-600 font-mono'
-                          : 'bg-slate-100 text-slate-500'
-                      }`}
-                    >
-                      {agent.status}
-                    </span>
+                  <div className="text-right flex flex-col items-end gap-0.5">
+                    <div className="flex items-center gap-1">
+                      {agent.step === 4 && (sandboxResult?.verified_via_synthesized_test || sandboxResult?.verifiedViaSynthesizedTest || agent.details?.verified_via_synthesized_test) && (
+                        <span className="text-[9px] font-bold text-[#7C3AED] bg-[#F5F3FF] border border-[#DDD6FE] px-1.5 py-0.5 rounded-full shadow-2xs">
+                          AI-Synthesized
+                        </span>
+                      )}
+                      <span
+                        className={`text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full ${
+                          isAgentPassed
+                            ? 'bg-[#DCFCE7] text-[#16A34A]'
+                            : isAgentWarning
+                            ? 'bg-[#FEF3C7] text-[#D97706] border border-[#FCD34D]'
+                            : isAgentSkipped
+                            ? 'bg-[#FEF3C7] text-[#D97706] border border-[#FCD34D]'
+                            : isAgentFailed
+                            ? 'bg-[#FEE2E2] text-[#DC2626] font-bold border border-[#FCA5A5]'
+                            : isAgentActive
+                            ? 'bg-[#DBEAFE] text-[#2563EB]'
+                            : isAgentNotImpl
+                            ? 'bg-slate-100 text-slate-600 font-mono'
+                            : 'bg-slate-100 text-slate-500'
+                        }`}
+                      >
+                        {agent.status}
+                      </span>
+                    </div>
                     {agent.time && (
                       <div className="text-[10px] text-[#94A3B8] font-mono mt-0.5">
                         {agent.time}

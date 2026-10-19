@@ -14,9 +14,11 @@ import { useApp } from '../../context/AppContext';
 import Button, { PrimaryButton } from '../../components/common/Button';
 import { StatusBadge } from '../../components/common/Badge';
 import StatCard from '../../components/common/StatCard';
+import MultiRepoQueueDashboard from '../../components/dashboard/MultiRepoQueueDashboard';
 
 export default function Dashboard() {
   const { repositories } = useApp();
+  const [activeTab, setActiveTab] = useState('queue');
   const [timeRange, setTimeRange] = useState('7d');
 
   // Realistic metrics matching Section 9
@@ -115,20 +117,52 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* 5 Stats Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
-        {stats.map((stat, idx) => (
-          <StatCard
-            key={idx}
-            title={stat.title}
-            value={stat.value}
-            subtitle={stat.subtitle}
-            change={stat.change}
-            changeType={stat.changeType}
-            icon={stat.icon}
-          />
-        ))}
+      {/* Primary Dashboard Navigation Tabs */}
+      <div className="flex items-center gap-2 border-b border-[#E2E8F0]">
+        <button
+          type="button"
+          onClick={() => setActiveTab('queue')}
+          className={`pb-3 px-3 text-sm font-bold border-b-2 transition-all flex items-center gap-2 ${
+            activeTab === 'queue'
+              ? 'border-[#2563EB] text-[#2563EB]'
+              : 'border-transparent text-[#64748B] hover:text-[#0F172A]'
+          }`}
+        >
+          <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+          <span>Multi-Repo Auto-Repair Queue</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveTab('overview')}
+          className={`pb-3 px-3 text-sm font-bold border-b-2 transition-all flex items-center gap-2 ${
+            activeTab === 'overview'
+              ? 'border-[#2563EB] text-[#2563EB]'
+              : 'border-transparent text-[#64748B] hover:text-[#0F172A]'
+          }`}
+        >
+          <span>Workspace Overview & Metrics</span>
+        </button>
       </div>
+
+      {activeTab === 'queue' ? (
+        <MultiRepoQueueDashboard />
+      ) : (
+        <>
+          {/* 5 Stats Cards */}
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+            {stats.map((stat, idx) => (
+              <StatCard
+                key={idx}
+                title={stat.title}
+                value={stat.value}
+                subtitle={stat.subtitle}
+                change={stat.change}
+                changeType={stat.changeType}
+                icon={stat.icon}
+              />
+            ))}
+          </div>
 
       {/* Visual Charts: Investigation Activity & Fix Success Rate */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -374,6 +408,8 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+        </>
+      )}
     </div>
   );
 }

@@ -65,7 +65,10 @@ async def run_sandbox_test(
             branch=payload.branch or "main",
             issue_number=payload.issue_number,
             patch=payload.patch,
-            access_token=token
+            access_token=token,
+            working_directory_override=payload.working_directory_override,
+            test_command_override=payload.test_command_override,
+            binding=payload.binding
         )
         return response
     except Exception as e:

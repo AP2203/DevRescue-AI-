@@ -2,6 +2,8 @@ import os
 import json
 import re
 import ast
+import time
+import uuid
 import asyncio
 import logging
 from typing import Dict, Any, List, Optional
@@ -62,15 +64,161 @@ def _sanitize_error(err: Exception) -> str:
     msg = re.sub(r'(nvapi-[A-Za-z0-9_\-]+)', '[REDACTED]', msg)
     return msg
 
+_TIMEOUT_MESSAGE_PATTERNS = (
+    "timeout",
+    "timed out",
+    "read timed out",
+    "connect timeout",
+    "connection timed out",
+    "deadline exceeded",
+)
+
+
+def new_correlation_id(prefix: str = "nem") -> str:
+    """Generates a short, non-secret correlation id to trace a single provider call chain."""
+    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def is_timeout_error(exc: BaseException) -> bool:
+    """
+    Robust timeout detection that does not rely on fragile substring matching alone.
+
+    The OpenAI SDK surfaces timeouts as ``APITimeoutError`` whose ``str()`` is
+    ``"Request timed out."``. That string does NOT contain the substring
+    ``"timeout"`` (it contains ``"timed out"``), which previously caused genuine
+    timeouts to be misclassified as generic 502 upstream errors.
+    """
+    if isinstance(exc, (asyncio.TimeoutError, APITimeoutError, httpx.TimeoutException)):
+        return True
+    if isinstance(exc, TimeoutError):  # builtin TimeoutError (asyncio.TimeoutError aliases this on 3.11)
+        return True
+    msg = str(exc).lower()
+    return any(pattern in msg for pattern in _TIMEOUT_MESSAGE_PATTERNS)
+
+
+def _status_code_of(exc: BaseException) -> Optional[int]:
+    """Best-effort extraction of an HTTP status code from an OpenAI/httpx exception."""
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+    try:
+        return int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _retry_after_seconds(exc: BaseException) -> Optional[float]:
+    """Reads provider ``Retry-After`` guidance (seconds) if present, respecting rate-limit guidance."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    try:
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_retryable_error(exc: BaseException) -> bool:
+    """
+    Classifies whether an error is safe to retry.
+
+    Retryable: timeouts, connection failures, HTTP 408/409/429 and 5xx.
+    Non-retryable: authentication (401/403), bad request (400) and malformed model output.
+    """
+    if isinstance(exc, (NemotronAuthError, NemotronResponseError)):
+        return False
+    if is_timeout_error(exc):
+        return True
+    if isinstance(exc, APIConnectionError):
+        return True
+    status_code = _status_code_of(exc)
+    if status_code is not None:
+        if status_code in (400, 401, 403, 404, 422):
+            return False
+        if status_code in (408, 409, 429) or status_code >= 500:
+            return True
+    msg = str(exc).lower()
+    if any(term in msg for term in ("rate limit", "connection", "temporarily unavailable", "overloaded", "bad gateway", "service unavailable")):
+        return True
+    return False
+
+
+def _repair_truncated_json(raw: str) -> Optional[Dict[str, Any]]:
+    """
+    Repairs truncated JSON strings where model output hit token limits.
+    Closes open strings, strips trailing incomplete keys/commas, and closes unclosed braces/brackets.
+    """
+    start_idx = raw.find('{')
+    if start_idx == -1:
+        return None
+
+    snippet = raw[start_idx:].strip()
+    in_string = False
+    escape = False
+    stack = []
+
+    for ch in snippet:
+        if escape:
+            escape = False
+            continue
+        if ch == '\\':
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if not in_string:
+            if ch in ('{', '['):
+                stack.append(ch)
+            elif ch == '}':
+                if stack and stack[-1] == '{':
+                    stack.pop()
+            elif ch == ']':
+                if stack and stack[-1] == '[':
+                    stack.pop()
+
+    repaired = snippet
+    if in_string:
+        repaired += '"'
+
+    # Remove trailing colon with unquoted value, or dangling key
+    repaired = re.sub(r':\s*"?[^"}\]]*$', ': ""', repaired)
+    # Remove trailing comma before closing
+    repaired = re.sub(r',\s*$', '', repaired)
+
+    # Close remaining unclosed brackets and braces in LIFO order
+    closing_map = {'{': '}', '[': ']'}
+    for opener in reversed(stack):
+        repaired += closing_map[opener]
+
+    try:
+        parsed = json.loads(repaired, strict=False)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
 def _extract_json_payload(content: str) -> Dict[str, Any]:
     """
     Robustly extracts and parses JSON/dict objects from model responses.
     Handles:
-    - Thinking/reasoning tags: <think>...</think>, <thought>...</thought>
-    - Markdown code blocks: ```json ... ``` or ``` ... ```
-    - Python dictionary syntax with single quotes: {'key': 'val'}
-    - Unquoted or mixed boolean/null literals
-    - Trailing commas before closing braces
+    - Thinking/reasoning tags: <think>...</think>, <thought>...</thought> (and unclosed tags)
+    - Markdown code fences: ```json ... ``` or ``` ... ```
+    - Inner braces/code blocks inside string values without premature non-greedy cutoff
+    - Slicing strictly from the first '{' to the last '}'
+    - Literal unescaped newlines and control characters via json.loads(..., strict=False)
+    - Python dictionary syntax with single quotes and boolean literals
+    - Truncated JSON repair (unclosed quotes/braces/brackets)
     """
     if not content or not content.strip():
         raise ValueError("Cannot extract JSON from empty content.")
@@ -80,38 +228,30 @@ def _extract_json_payload(content: str) -> Dict[str, Any]:
     # Step 1: Strip thinking/reasoning blocks
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'<thought>.*?</thought>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = text.strip()
-
-    # If <think> was opened but not closed (e.g. truncated)
+    # If <think> was opened but never closed (e.g. truncated)
     if "<think>" in text.lower():
         text = re.sub(r'<think>.*', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    if "<thought>" in text.lower():
+        text = re.sub(r'<thought>.*', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
 
-    # Step 2: If explicit ```json block containing root_cause exists, prioritize it
-    json_blocks = re.findall(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text, flags=re.IGNORECASE)
-    for block in json_blocks:
-        if 'root_cause' in block:
-            text = block.strip()
-            break
+    # Step 2: Strip markdown code block fences ```json ... ``` or ``` ... ```
+    text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*```$', '', text)
 
-    # Step 3: Locate outermost or root_cause-targeted JSON boundaries { ... }
-    rc_idx = text.find('"root_cause"')
-    if rc_idx == -1:
-        rc_idx = text.find("'root_cause'")
-
-    if rc_idx != -1:
-        start_idx = text.rfind('{', 0, rc_idx)
-    else:
-        start_idx = text.find('{')
-
+    # Step 3: Locate outermost JSON boundaries from first '{' to last '}'
+    start_idx = text.find('{')
     end_idx = text.rfind('}')
+
     if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
-        text = text[start_idx : end_idx + 1]
+        candidate = text[start_idx : end_idx + 1].strip()
+    elif start_idx != -1:
+        candidate = text[start_idx:].strip()
+    else:
+        candidate = text.strip()
 
-    text = text.strip()
-
-    # Step 4: Attempt standard JSON parsing
+    # Step 4: Attempt standard JSON parsing with strict=False (allows literal newlines in strings)
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(candidate, strict=False)
         if isinstance(parsed, dict):
             return parsed
     except Exception:
@@ -119,7 +259,7 @@ def _extract_json_payload(content: str) -> Dict[str, Any]:
 
     # Step 5: Attempt safe Python literal evaluation (handles single-quoted dicts without mutating string contents)
     try:
-        tree = ast.parse(text, mode='eval')
+        tree = ast.parse(candidate, mode='eval')
         allowed_nodes = (
             ast.Expression, ast.Dict, ast.List, ast.Tuple, ast.Set,
             ast.Constant, ast.UnaryOp, ast.USub, ast.UAdd, ast.Name, ast.Load
@@ -139,16 +279,24 @@ def _extract_json_payload(content: str) -> Dict[str, Any]:
 
     # Step 6: Single-quote to double-quote conversion repair
     try:
-        repaired = re.sub(r',\s*([}\]])', r'\1', text)
+        repaired = re.sub(r',\s*([}\]])', r'\1', candidate)
         repaired = re.sub(r"(?<!\\)'([^'\\]*(?:\\.[^'\\]*)*)'", r'"\1"', repaired)
-        parsed = json.loads(repaired)
+        parsed = json.loads(repaired, strict=False)
         if isinstance(parsed, dict):
             return parsed
     except Exception:
         pass
 
-    # Step 7: Final strict parse attempt to raise descriptive JSONDecodeError if invalid
-    return json.loads(text)
+    # Step 7: Truncated JSON repair fallback (close unclosed quotes/braces when truncated)
+    try:
+        repaired_dict = _repair_truncated_json(text)
+        if repaired_dict and isinstance(repaired_dict, dict):
+            return repaired_dict
+    except Exception:
+        pass
+
+    # Step 8: Final parse attempt using strict=False to raise descriptive JSONDecodeError if invalid
+    return json.loads(candidate, strict=False)
 
 
 class NemotronService:
@@ -161,26 +309,176 @@ class NemotronService:
         self.provider = "NVIDIA"
 
     def get_client(self) -> AsyncOpenAI:
-        """Instantiates AsyncOpenAI client using configured timeout settings."""
+        """
+        Instantiates AsyncOpenAI client using explicit, configurable timeout settings.
+
+        Note: ``max_retries=0`` disables the SDK's hidden retry loop so that DevRescue's
+        own bounded retry policy is authoritative. This prevents silently duplicated
+        inference requests (which waste tokens and can double effective latency) when
+        the outcome of a prior attempt is uncertain.
+        """
         if not settings.NVIDIA_API_KEY or not settings.NVIDIA_API_KEY.strip():
             raise ValueError("NVIDIA_API_KEY environment variable is not configured.")
         timeout_config = httpx.Timeout(
             timeout=settings.NEMOTRON_TIMEOUT,
             connect=settings.NEMOTRON_CONNECT_TIMEOUT,
             read=settings.NEMOTRON_TIMEOUT,
-            write=30.0
+            write=30.0,
+            pool=settings.NEMOTRON_CONNECT_TIMEOUT
         )
         return AsyncOpenAI(
             api_key=settings.NVIDIA_API_KEY,
             base_url=settings.NVIDIA_BASE_URL,
-            timeout=timeout_config
+            timeout=timeout_config,
+            max_retries=0
+        )
+
+    def _classify_error(
+        self,
+        exc: BaseException,
+        *,
+        attempts: int,
+        correlation_id: str,
+        context: str
+    ) -> NemotronError:
+        """
+        Maps a provider/transport exception to a typed NemotronError.
+
+        Distinguishes timeouts, rate limits (429), authentication failures (401/403),
+        bad requests (400), and generic upstream (5xx/connection) failures.
+        """
+        status_code = _status_code_of(exc)
+        msg = str(exc).lower()
+
+        if is_timeout_error(exc):
+            error: NemotronError = NemotronTimeoutError(
+                f"Nemotron {context} timed out after {attempts} attempt(s) "
+                f"(correlation_id={correlation_id})."
+            )
+        elif status_code in (401, 403) or any(term in msg for term in ("unauthorized", "authentication", "forbidden", "api key")):
+            error = NemotronAuthError(
+                f"Nemotron authentication error during {context} "
+                f"(correlation_id={correlation_id}): {_sanitize_error(exc)}"
+            )
+        elif status_code == 429 or "rate limit" in msg or "too many requests" in msg:
+            error = NemotronRateLimitError(
+                f"Nemotron rate limit exceeded during {context} after {attempts} attempt(s) "
+                f"(correlation_id={correlation_id})."
+            )
+        elif status_code == 400 or "bad request" in msg:
+            error = NemotronAPIError(
+                f"Nemotron rejected the {context} request (correlation_id={correlation_id}): "
+                f"{_sanitize_error(exc)}"
+            )
+        else:
+            error = NemotronAPIError(
+                f"Nemotron {context} failed after {attempts} attempt(s) "
+                f"(correlation_id={correlation_id}): {_sanitize_error(exc)}"
+            )
+        error.correlation_id = correlation_id
+        return error
+
+    async def call_model_with_retries(
+        self,
+        client: AsyncOpenAI,
+        messages: List[Dict[str, Any]],
+        *,
+        max_tokens: int = 4096,
+        temperature: float = 0.1,
+        extra_body: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        correlation_id: Optional[str] = None,
+        context: str = "model call"
+    ) -> str:
+        """
+        Executes a bounded, non-streaming chat completion with:
+        - explicit per-request timeout (model-inference appropriate, configurable),
+        - bounded exponential backoff retries only for retryable errors,
+        - provider ``Retry-After`` guidance honored for 429/slow responses,
+        - typed error classification and a correlation id,
+        - cancellation-safe behaviour (``asyncio.CancelledError`` always propagates).
+        """
+        timeout_val = timeout or settings.NEMOTRON_TIMEOUT
+        retries = settings.NEMOTRON_MAX_RETRIES if max_retries is None else max(0, int(max_retries))
+        cid = correlation_id or new_correlation_id()
+        nl = logging.getLogger("devrescue.nemotron")
+
+        last_exc: Optional[BaseException] = None
+        for attempt in range(retries + 1):
+            started = time.monotonic()
+            try:
+                response = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=settings.NEMOTRON_MODEL,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        extra_body=extra_body,
+                        stream=False,
+                        timeout=timeout_val
+                    ),
+                    timeout=timeout_val + 5.0
+                )
+                if not response or not getattr(response, "choices", None):
+                    raise NemotronResponseError("Nemotron returned an empty response.")
+
+                choice = response.choices[0]
+                content = None
+                message = getattr(choice, "message", None)
+                if message is not None:
+                    content = getattr(message, "content", None)
+                if not content:
+                    delta = getattr(choice, "delta", None)
+                    content = getattr(delta, "content", None) if delta is not None else None
+                if not content or not str(content).strip():
+                    raise NemotronResponseError("Nemotron returned an empty response.")
+
+                elapsed = time.monotonic() - started
+                nl.info(
+                    f"[NEMOTRON] {context} succeeded (correlation_id={cid}, "
+                    f"attempt={attempt + 1}/{retries + 1}, elapsed={elapsed:.2f}s)"
+                )
+                return str(content)
+            except NemotronResponseError:
+                # Malformed/empty model output is not retried here; callers may recover.
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - classified below
+                last_exc = exc
+                elapsed = time.monotonic() - started
+                if is_retryable_error(exc) and attempt < retries:
+                    backoff = min(8.0, 1.0 * (2 ** attempt))
+                    retry_after = _retry_after_seconds(exc)
+                    if retry_after is not None:
+                        backoff = max(backoff, retry_after)
+                    nl.warning(
+                        f"[NEMOTRON] {context} attempt {attempt + 1}/{retries + 1} failed after "
+                        f"{elapsed:.2f}s (correlation_id={cid}): {_sanitize_error(exc)}. "
+                        f"Retrying in {backoff:.1f}s..."
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                raise self._classify_error(
+                    exc,
+                    attempts=attempt + 1,
+                    correlation_id=cid,
+                    context=context
+                ) from exc
+
+        raise self._classify_error(
+            last_exc or RuntimeError("unknown provider failure"),
+            attempts=retries + 1,
+            correlation_id=cid,
+            context=context
         )
 
     async def _call_model_stream_or_complete(
         self,
         client: AsyncOpenAI,
         messages: List[Dict[str, Any]],
-        max_tokens: int = 1024,
+        max_tokens: int = 4096,
         temperature: float = 0.1,
         extra_body: Optional[Dict[str, Any]] = None,
         timeout: Optional[float] = None
@@ -390,7 +688,7 @@ class NemotronService:
                             {"role": "user", "content": user_content}
                         ],
                         temperature=0.1,
-                        max_tokens=1024,
+                        max_tokens=4096,
                         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                         timeout=settings.NEMOTRON_TIMEOUT
                     ),
@@ -467,7 +765,7 @@ class NemotronService:
 
             except Exception as e:
                 err_msg = str(e).lower()
-                if "timeout" in err_msg:
+                if is_timeout_error(e):
                     if attempt < max_retries:
                         backoff = min(8.0, 1.0 * (2 ** attempt))
                         nem_logger.warning(
@@ -492,11 +790,53 @@ class NemotronService:
 
         logger.info(f"[INVESTIGATE] Raw Nemotron response:\n{raw_content}")
         print(f"[INVESTIGATE] Raw Nemotron response:\n{raw_content}", flush=True)
-        try:
-            parsed = _extract_json_payload(raw_content)
-            result = NemotronInvestigateResponse(**parsed)
-        except Exception as pe:
-            raise NemotronResponseError(f"Nemotron returned invalid JSON structure: {_sanitize_error(pe)}") from pe
+
+        # Parse Nemotron response with bounded retry (up to 2 attempts) for malformed JSON
+        JSON_MAX_RETRIES = 2
+        result = None
+        current_content = raw_content
+
+        for json_attempt in range(JSON_MAX_RETRIES + 1):
+            try:
+                parsed = _extract_json_payload(current_content)
+                result = NemotronInvestigateResponse(**parsed)
+                break
+            except Exception as pe:
+                if json_attempt < JSON_MAX_RETRIES:
+                    nem_logger.warning(
+                        f"[NEMOTRON] Malformed JSON on attempt {json_attempt + 1}/{JSON_MAX_RETRIES + 1}: {_sanitize_error(pe)}. Retrying with JSON correction prompt..."
+                    )
+                    correction_messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                        {"role": "assistant", "content": current_content[:2500]},
+                        {
+                            "role": "user",
+                            "content": (
+                                "CRITICAL JSON ERROR: Your previous response could not be parsed as valid JSON: "
+                                f"{_sanitize_error(pe)}. "
+                                "Return ONLY a valid, properly escaped JSON object starting directly with '{' and ending with '}'. "
+                                "Ensure all newlines inside string values are escaped as \\n, all quotes are properly closed, and do NOT include any markdown code blocks or thinking tags."
+                            )
+                        }
+                    ]
+                    try:
+                        current_content = await asyncio.wait_for(
+                            self._call_model_stream_or_complete(
+                                client=client,
+                                messages=correction_messages,
+                                temperature=0.1,
+                                max_tokens=4096,
+                                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                                timeout=settings.NEMOTRON_TIMEOUT
+                            ),
+                            timeout=settings.NEMOTRON_TIMEOUT + 5.0
+                        )
+                        continue
+                    except Exception as retry_err:
+                        nem_logger.warning(f"[NEMOTRON] JSON correction call error: {retry_err}")
+
+                raise NemotronResponseError(f"Nemotron returned invalid JSON structure: {_sanitize_error(pe)}") from pe
 
         # 1. Validate root_cause is not empty
         if not result.root_cause or not result.root_cause.strip():
@@ -560,7 +900,8 @@ class NemotronService:
             "1. Modify ONLY existing files supplied in the context.\n"
             "2. Do NOT invent new files or modify unrelated files.\n"
             "3. The diff must be standard unified diff format (starting with '--- a/path' and '+++ b/path').\n"
-            "4. Return strict JSON matching:\n"
+            "4. Paths MUST be repository-relative and MUST exactly match a supplied path. NEVER prefix paths with the repository owner or name, and never add extra leading directories.\n"
+            "5. Return strict JSON matching:\n"
             "{\n"
             '  "patch": "--- a/path/to/file.py\\n+++ b/path/to/file.py\\n@@ ... @@\\n...",\n'
             '  "changed_files": ["path/to/file.py"],\n'
@@ -578,40 +919,133 @@ class NemotronService:
             f"SUPPLIED TEST FILES:\n{tests_context}"
         )
 
-        response = await client.chat.completions.create(
-            model=settings.NEMOTRON_MODEL,
+        raw_content = await self._call_model_stream_or_complete(
+            client=client,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}
             ],
-            temperature=0.2
+            temperature=0.1,
+            max_tokens=4096,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            timeout=settings.NEMOTRON_TIMEOUT
         )
 
-        if not response.choices or not response.choices[0].message.content:
-            raise ValueError("Nemotron returned an empty patch response.")
+        if not raw_content or not raw_content.strip():
+            raise NemotronResponseError("Nemotron returned an empty patch response.")
 
-        raw_content = response.choices[0].message.content
-        parsed = _extract_json_payload(raw_content)
-        result = NemotronPatchResponse(**parsed)
+        JSON_MAX_RETRIES = 2
+        result = None
+        current_content = raw_content
+
+        for json_attempt in range(JSON_MAX_RETRIES + 1):
+            try:
+                parsed = _extract_json_payload(current_content)
+                result = NemotronPatchResponse(**parsed)
+                break
+            except Exception as pe:
+                if json_attempt < JSON_MAX_RETRIES:
+                    nem_logger = logging.getLogger("devrescue.nemotron")
+                    nem_logger.warning(
+                        f"[NEMOTRON] Malformed patch JSON on attempt {json_attempt + 1}/{JSON_MAX_RETRIES + 1}: {_sanitize_error(pe)}. Retrying with patch correction prompt..."
+                    )
+                    correction_messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                        {"role": "assistant", "content": current_content[:2500]},
+                        {
+                            "role": "user",
+                            "content": (
+                                "CRITICAL JSON ERROR: Your previous response could not be parsed as valid patch JSON: "
+                                f"{_sanitize_error(pe)}. "
+                                "Return ONLY a valid, properly escaped JSON object starting directly with '{' and ending with '}'. "
+                                "Ensure the unified diff inside 'patch' has newlines escaped as \\n, all quotes are properly closed, and do NOT include any markdown code blocks or thinking tags."
+                            )
+                        }
+                    ]
+                    try:
+                        current_content = await self._call_model_stream_or_complete(
+                            client=client,
+                            messages=correction_messages,
+                            temperature=0.1,
+                            max_tokens=4096,
+                            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                            timeout=settings.NEMOTRON_TIMEOUT
+                        )
+                        continue
+                    except Exception as retry_err:
+                        nem_logger.warning(f"[NEMOTRON] Patch correction call error: {retry_err}")
+
+                raise NemotronResponseError(f"Nemotron returned invalid patch JSON structure: {_sanitize_error(pe)}") from pe
 
         if not result.patch or not result.patch.strip():
-            raise ValueError("Generated patch is empty.")
+            raise NemotronResponseError("Generated patch is empty.")
 
         if "--- " not in result.patch or "+++ " not in result.patch:
-            raise ValueError("Generated patch does not contain valid unified diff headers (--- / +++).")
+            raise NemotronResponseError("Generated patch does not contain valid unified diff headers (--- / +++).")
 
         if not result.changed_files:
-            raise ValueError("Generated patch must list at least one changed file.")
+            raise NemotronResponseError("Generated patch must list at least one changed file.")
 
         # Security check: the patch and changed_files must reference only available files
         for changed_file in result.changed_files:
             if changed_file not in available_paths:
-                raise ValueError(
+                raise NemotronResponseError(
                     f"Generated patch references file not present in repository context: '{changed_file}'. "
                     f"Available files: {sorted(list(available_paths))}"
                 )
 
         return result
+
+    async def investigate_issue(
+        self,
+        owner: str,
+        repo: str,
+        issue_number: int,
+        branch: str = "main",
+        access_token: Optional[str] = None
+    ) -> NemotronInvestigateResponse:
+        """
+        Orchestrates full issue investigation:
+        1. Queries GitHub issue details.
+        2. Retrieves repository tree and analyzes candidate files.
+        3. Calls investigate_bug with repository context.
+        """
+        from app.services.repository_analyzer import repository_analyzer
+        from app.services.github_service import github_service
+
+        repo_info = await github_service.get_repository(access_token, owner, repo)
+        target_branch = branch or repo_info.get("default_branch") or "main"
+
+        issue = await repository_analyzer.get_issue_details(
+            owner=owner,
+            repo=repo,
+            issue_number=issue_number,
+            access_token=access_token
+        )
+
+        tree_res = await github_service.get_repository_tree(access_token, owner, repo, target_branch)
+
+        analysis = await repository_analyzer.analyze_repository_for_issue(
+            owner=owner,
+            repo=repo,
+            issue_number=issue_number,
+            branch=target_branch,
+            access_token=access_token,
+            repo_info=repo_info,
+            issue=issue,
+            tree_res=tree_res
+        )
+
+        if not analysis.get("files") and not analysis.get("tests"):
+            raise ValueError(f"Repository '{owner}/{repo}' contains no source or test files to analyze.")
+
+        return await self.investigate_bug(
+            issue=analysis["issue"],
+            repository=analysis["repository"],
+            files=analysis["files"],
+            tests=analysis.get("tests", [])
+        )
 
 
 nemotron_service = NemotronService()

@@ -7,18 +7,49 @@
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8001';
 
+// Request timeouts. Long-running AI/Docker operations get a larger budget so a
+// slow-but-healthy operation is not misreported as a network failure.
+const DEFAULT_TIMEOUT_MS = 120000;
+const AI_TIMEOUT_MS = 420000;      // Nemotron (up to 3 attempts) + GitHub retrieval
+const SANDBOX_TIMEOUT_MS = 900000; // Docker image build + dependency prep + test run
+
+export const ERROR_CODES = {
+  NETWORK_ERROR: 'NETWORK_ERROR',
+  REQUEST_TIMEOUT: 'REQUEST_TIMEOUT',
+  REQUEST_ABORTED: 'REQUEST_ABORTED'
+};
+
 async function request(endpoint, options = {}) {
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, signal: externalSignal, ...fetchOptions } = options;
   const url = `${API_URL}${endpoint}`;
   const headers = {
     'Content-Type': 'application/json',
-    ...(options.headers || {})
+    ...(fetchOptions.headers || {})
   };
+
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = timeoutMs > 0
+    ? setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs)
+    : null;
+
+  // Link an optional external cancellation signal to our controller.
+  let onExternalAbort = null;
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      onExternalAbort = () => controller.abort();
+      externalSignal.addEventListener('abort', onExternalAbort);
+    }
+  }
 
   try {
     const response = await fetch(url, {
-      ...options,
+      ...fetchOptions,
       headers,
-      credentials: 'include' // Sends session cookie securely across origins
+      credentials: 'include', // Sends session cookie securely across origins
+      signal: controller.signal
     });
 
     if (!response.ok) {
@@ -33,13 +64,53 @@ async function request(endpoint, options = {}) {
       const err = new Error(errorMessage);
       err.status = response.status;
       err.data = errorData;
+      err.errorCode = (errorData && (errorData.error_code || errorData.error)) || null;
+      err.isHttpError = true;
       throw err;
     }
 
     return await response.json();
   } catch (error) {
+    // 1. Client-side timeout: the request did not complete within the budget.
+    if (timedOut) {
+      const err = new Error(`Request to ${endpoint} timed out after ${Math.round(timeoutMs / 1000)}s. The backend may still be processing; this operation is NOT confirmed and must be retried.`);
+      err.status = null;
+      err.errorCode = ERROR_CODES.REQUEST_TIMEOUT;
+      err.isTimeout = true;
+      console.error(`[DevRescue API Timeout] ${endpoint}:`, err);
+      throw err;
+    }
+
+    // 2. Explicit cancellation (e.g. a superseded run) — surface distinctly.
+    if (error?.name === 'AbortError') {
+      const err = new Error('Request was cancelled.');
+      err.status = null;
+      err.errorCode = ERROR_CODES.REQUEST_ABORTED;
+      err.isAborted = true;
+      throw err;
+    }
+
+    // 3. Transport-level failure: server down, connection reset, DNS, or CORS
+    //    (this is what the browser reports as "Failed to fetch"). Never treat
+    //    this as a successful result.
+    if (error?.name === 'TypeError') {
+      const err = new Error(`Cannot reach the DevRescue backend at ${API_URL}. The request to ${endpoint} failed at the network layer (server not running, connection reset, or blocked by CORS).`);
+      err.status = null;
+      err.errorCode = ERROR_CODES.NETWORK_ERROR;
+      err.isNetworkError = true;
+      err.cause = error;
+      console.error(`[DevRescue API Network Error] ${endpoint}:`, error);
+      throw err;
+    }
+
+    // 4. Already-classified HTTP error, or anything else — rethrow unchanged.
     console.error(`[DevRescue API Error] ${endpoint}:`, error);
     throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (externalSignal && onExternalAbort) {
+      externalSignal.removeEventListener('abort', onExternalAbort);
+    }
   }
 }
 
@@ -153,34 +224,42 @@ export async function approveRun(id, runId, payload = {}) {
 // -------------------------------------------------------------
 // 3b. Real NVIDIA Nemotron Investigation API
 // -------------------------------------------------------------
-export async function investigateNemotron(payload) {
+export async function investigateNemotron(payload, options = {}) {
   console.log('[REAL INVESTIGATION] POST /api/ai/nemotron/investigate', payload);
   return request('/api/ai/nemotron/investigate', {
     method: 'POST',
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    timeoutMs: AI_TIMEOUT_MS,
+    ...options
   });
 }
 
-export async function generateNemotronPatch(payload) {
+export async function generateNemotronPatch(payload, options = {}) {
   return request('/api/ai/nemotron/generate-patch', {
     method: 'POST',
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    timeoutMs: AI_TIMEOUT_MS,
+    ...options
   });
 }
 
-export async function generatePatch(payload) {
+export async function generatePatch(payload, options = {}) {
   console.log('[REAL PATCH] POST /api/ai/nemotron/patch', payload);
   return request('/api/ai/nemotron/patch', {
     method: 'POST',
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    timeoutMs: AI_TIMEOUT_MS,
+    ...options
   });
 }
 
-export async function runSandboxTest(payload) {
+export async function runSandboxTest(payload, options = {}) {
   console.log('[REAL SANDBOX TEST] POST /api/ai/sandbox/test', payload);
   return request('/api/ai/sandbox/test', {
     method: 'POST',
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    timeoutMs: SANDBOX_TIMEOUT_MS,
+    ...options
   });
 }
 
@@ -275,6 +354,91 @@ export async function createPullRequest(data) {
   });
 }
 
+// -------------------------------------------------------------
+// 7. Multi-Repository Discovery & Auto-Repair Queue
+// -------------------------------------------------------------
+export async function discoverRepositoriesAndIssues(options = {}) {
+  return request('/api/queue/discover', {
+    method: 'POST',
+    body: JSON.stringify(options)
+  });
+}
+
+export async function getQueueRepositories() {
+  return request('/api/queue/repositories');
+}
+
+export async function getQueueIssues(params = {}) {
+  const query = new URLSearchParams();
+  if (params.repo) query.set('repo', params.repo);
+  if (params.severity) query.set('severity', params.severity);
+  if (params.triage_status) query.set('triage_status', params.triage_status);
+  if (params.search) query.set('search', params.search);
+  const qStr = query.toString();
+  return request(`/api/queue/issues${qStr ? `?${qStr}` : ''}`);
+}
+
+export async function enqueueIssues(issueKeys, priorityOverride = null) {
+  return request('/api/queue/enqueue', {
+    method: 'POST',
+    body: JSON.stringify({
+      issue_keys: issueKeys,
+      priority_override: priorityOverride
+    })
+  });
+}
+
+export async function getQueueJobs(params = {}) {
+  const query = new URLSearchParams();
+  if (params.status) query.set('status', params.status);
+  if (params.repo) query.set('repo', params.repo);
+  const qStr = query.toString();
+  return request(`/api/queue/jobs${qStr ? `?${qStr}` : ''}`);
+}
+
+export async function getQueueJob(jobId) {
+  return request(`/api/queue/jobs/${encodeURIComponent(jobId)}`);
+}
+
+export async function cancelQueueJob(jobId) {
+  return request(`/api/queue/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: 'POST'
+  });
+}
+
+export async function retryQueueJob(jobId, force = false) {
+  return request(`/api/queue/jobs/${encodeURIComponent(jobId)}/retry`, {
+    method: 'POST',
+    body: JSON.stringify({ force })
+  });
+}
+
+export async function approveQueueJob(jobId, patchHash = null, comment = null) {
+  return request(`/api/queue/jobs/${encodeURIComponent(jobId)}/approve`, {
+    method: 'POST',
+    body: JSON.stringify({ patch_hash: patchHash, comment })
+  });
+}
+
+export async function startQueueProcessing() {
+  return request('/api/queue/start', { method: 'POST' });
+}
+
+export async function pauseQueueProcessing() {
+  return request('/api/queue/pause', { method: 'POST' });
+}
+
+export async function getQueueStats() {
+  return request('/api/queue/stats');
+}
+
+export async function updateQueueConfig(config) {
+  return request('/api/queue/config', {
+    method: 'PUT',
+    body: JSON.stringify(config)
+  });
+}
+
 const api = {
   healthCheck,
   getRiskHealth,
@@ -310,7 +474,20 @@ const api = {
   getGithubCommits,
   getRepositories,
   getPullRequests,
-  createPullRequest
+  createPullRequest,
+  discoverRepositoriesAndIssues,
+  getQueueRepositories,
+  getQueueIssues,
+  enqueueIssues,
+  getQueueJobs,
+  getQueueJob,
+  cancelQueueJob,
+  retryQueueJob,
+  approveQueueJob,
+  startQueueProcessing,
+  pauseQueueProcessing,
+  getQueueStats,
+  updateQueueConfig
 };
 
 export { api };

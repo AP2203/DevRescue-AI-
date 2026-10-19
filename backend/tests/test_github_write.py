@@ -284,6 +284,22 @@ async def test_approval_required():
         assert res.status_code == 403
         assert "human approval is required" in res.json()["detail"].lower()
 
+
+@pytest.mark.asyncio
+async def test_pr_creation_requires_valid_investigation_id():
+    """Verify that attempting to create a PR with fabricated approval but no investigation_id is rejected."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        payload = {
+            "repository": "owner/repo",
+            "title": "fix: fabricated approval without investigation",
+            "approved": True
+        }
+        res = await ac.post("/api/pull-requests", json=payload)
+        assert res.status_code == 400
+        assert "investigation_id" in res.json()["detail"].lower()
+
+
 # 13. GitHub 401
 def test_github_401():
     service = GitHubService()

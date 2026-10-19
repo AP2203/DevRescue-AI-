@@ -1126,4 +1126,178 @@ async def test_api_investigate_nemotron_api_error_returns_502_nemotron():
             assert data["detail"]["error"] == "bad_gateway"
 
 
+def test_extract_json_payload_with_think_blocks():
+    """Verify reasoning <think> and <thought> blocks are cleanly stripped before JSON parsing."""
+    from app.services.nemotron_service import _extract_json_payload
+    content = """
+    <think>
+    The bug is in the calculateTotal method.
+    Let's check line 24.
+    If total < 0, it throws an error.
+    </think>
+    {
+      "root_cause": "Negative total calculation on empty cart",
+      "confidence": 0.95,
+      "affected_files": ["src/cart.py"]
+    }
+    """
+    res = _extract_json_payload(content)
+    assert res["root_cause"] == "Negative total calculation on empty cart"
+    assert res["confidence"] == 0.95
+    assert res["affected_files"] == ["src/cart.py"]
+
+
+def test_extract_json_payload_with_markdown_fences():
+    """Verify markdown code fences ```json ... ``` are cleanly unwrapped."""
+    from app.services.nemotron_service import _extract_json_payload
+    content = """```json
+    {
+      "root_cause": "Missing null check in user loader",
+      "confidence": 0.92,
+      "affected_files": ["src/user.py"]
+    }
+    ```"""
+    res = _extract_json_payload(content)
+    assert res["root_cause"] == "Missing null check in user loader"
+    assert res["confidence"] == 0.92
+
+
+def test_extract_json_payload_with_literal_newlines_inside_strings():
+    """Verify literal newlines inside strings do not cause 'Unterminated string' JSONDecodeError."""
+    from app.services.nemotron_service import _extract_json_payload
+    # Note raw unescaped newlines inside the root_cause value:
+    content = '{\n  "root_cause": "Error traceback:\nline 42 in handler\nTypeError: NoneType has no attribute get",\n  "confidence": 0.9\n}'
+    res = _extract_json_payload(content)
+    assert "line 42 in handler" in res["root_cause"]
+    assert res["confidence"] == 0.9
+
+
+def test_extract_json_payload_with_inner_code_braces():
+    """Verify inner code braces { ... } inside explanations or diffs do not cause premature cutoff."""
+    from app.services.nemotron_service import _extract_json_payload
+    content = """
+    Here is the diagnosis:
+    {
+      "root_cause": "The function definition if (valid) { doSomething(); } lacks an else block { handleError(); }",
+      "confidence": 0.98,
+      "proposed_fix": "Add else { return false; }"
+    }
+    """
+    res = _extract_json_payload(content)
+    assert "doSomething(); }" in res["root_cause"]
+    assert "handleError(); }" in res["root_cause"]
+    assert res["confidence"] == 0.98
+    assert res["proposed_fix"] == "Add else { return false; }"
+
+
+def test_extract_json_payload_with_truncated_strings_repair():
+    """Verify truncated string output from token exhaustion is repaired with closed quote and brace."""
+    from app.services.nemotron_service import _extract_json_payload, _repair_truncated_json
+    truncated_content = '{\n  "root_cause": "The system crashed because the database connection timed out during startup'
+    res = _extract_json_payload(truncated_content)
+    assert "database connection timed out" in res["root_cause"]
+
+
+def test_extract_json_payload_with_truncated_arrays_repair():
+    """Verify truncated JSON with unclosed arrays and objects is safely closed and parsed."""
+    from app.services.nemotron_service import _extract_json_payload
+    truncated_content = '{\n  "root_cause": "Buffer overflow",\n  "affected_files": ["src/main.c", "src/net.c"'
+    res = _extract_json_payload(truncated_content)
+    assert res["root_cause"] == "Buffer overflow"
+    assert res["affected_files"] == ["src/main.c", "src/net.c"]
+
+
+@pytest.mark.asyncio
+async def test_investigate_bug_bounded_retry_on_malformed_json():
+    """Verify investigate_bug recovers when first attempt returns malformed JSON and retry returns valid JSON."""
+    from app.services.nemotron_service import nemotron_service
+    from unittest.mock import AsyncMock, patch
+
+    mock_client = MagicMock()
+    malformed_json = 'This is not JSON at all: "root_cause": broken'
+    valid_json = """{
+      "root_cause": "Memory leak in worker thread",
+      "confidence": 0.95,
+      "affected_files": ["src/worker.py"],
+      "affected_functions": ["run_worker"],
+      "evidence": [{"file": "src/worker.py", "line": 15, "reason": "Unclosed socket"}],
+      "proposed_fix": "Close socket in finally block",
+      "test_strategy": "Run unit tests"
+    }"""
+
+    # First call returns malformed, second call (correction) returns valid JSON
+    with patch.object(nemotron_service, "get_client", return_value=mock_client), \
+         patch.object(nemotron_service, "_call_model_stream_or_complete", AsyncMock(side_effect=[malformed_json, valid_json])):
+
+        issue = {"number": 1, "title": "Memory leak", "body": "Leak detected", "comments": []}
+        repository = {"owner": "test-owner", "name": "test-repo", "default_branch": "main"}
+        files = [{"path": "src/worker.py", "content": "def run_worker(): pass"}]
+
+        resp = await nemotron_service.investigate_bug(issue, repository, files)
+        assert resp.root_cause == "Memory leak in worker thread"
+        assert resp.confidence == 0.95
+        assert resp.affected_files == ["src/worker.py"]
+
+
+@pytest.mark.asyncio
+async def test_investigation_status_transitions_to_failed_when_nemotron_upstream_fails():
+    """Verify that when Stage 3 (Root Cause Diagnosis) encounters a fatal Nemotron error,
+    the failing stage is marked FAILED, all downstream stages are marked SKIPPED,
+    and investigation.status is updated to FAILED (not IN_PROGRESS)."""
+    from app.services.investigation_service import investigation_service
+    from app.services.nemotron_service import NemotronResponseError
+
+    # Create investigation
+    inv = await investigation_service.create_github_investigation(
+        repository="test-owner/test-repo",
+        owner="test-owner",
+        repo="test-repo",
+        branch="main",
+        issue_number=10,
+        issue_title="Unterminated string crash"
+    )
+    inv_id = inv["id"]
+    run_id = inv["latest_run_id"]
+
+    # Mock nemotron_service.investigate_issue to raise fatal NemotronResponseError
+    with patch("app.services.nemotron_service.nemotron_service.investigate_issue",
+               AsyncMock(side_effect=NemotronResponseError("Nemotron returned invalid JSON structure: Unterminated string starting at: line 2 column 17"))):
+
+        await investigation_service.execute_staged_run(inv_id, run_id, mode="demo")
+
+    # Verify overall investigation state
+    updated_inv = investigation_service.get_investigation(inv_id)
+    assert updated_inv["status"] == "FAILED"
+    assert "Unterminated string" in updated_inv["error_summary"]
+
+    # Verify run record
+    run = investigation_service.get_run(run_id)
+    assert run["status"] == "FAILED"
+    assert "Unterminated string" in run["error_summary"]
+
+    # Stage 1 and 2 passed
+    assert run["stages"][0]["status"] == "PASSED"
+    assert run["stages"][1]["status"] == "PASSED"
+
+    # Stage 3 (Root Cause Diagnosis) is FAILED
+    assert run["stages"][2]["status"] == "FAILED"
+    assert "Unterminated string" in run["stages"][2]["summary"]
+
+    # All downstream stages (4 to 11) must be SKIPPED
+    for stage in run["stages"][3:]:
+        assert stage["status"] == "SKIPPED", f"Stage {stage['key']} should be SKIPPED but is {stage['status']}"
+
+    # Verify agent mapping reflected in investigation.agents
+    agents = updated_inv["agents"]
+    bug_investigator = next(a for a in agents if a["name"] == "Bug Investigator")
+    assert bug_investigator["status"] == "FAILED"
+
+    code_repair = next(a for a in agents if a["name"] == "Code Repair Agent")
+    assert code_repair["status"] == "SKIPPED"
+
+    testing_agent = next(a for a in agents if a["name"] == "Testing Agent")
+    assert testing_agent["status"] == "SKIPPED"
+
+
+
 

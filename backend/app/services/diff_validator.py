@@ -55,6 +55,24 @@ class DiffScopeError(DiffValidationError):
     pass
 
 
+class DiffBindingError(DiffValidationError):
+    """
+    Raised when a patch is bound to a different repository than the active
+    investigation/workspace. This is never silently repaired: the patch must be
+    regenerated against the correct repository context.
+    """
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 400,
+        file: Optional[str] = None,
+        hunk: Optional[int] = None,
+        details: Optional[Dict[str, Any]] = None
+    ):
+        super().__init__(message, status_code=status_code, file=file, hunk=hunk)
+        self.details = details or {}
+
+
 class DiffLimitExceededError(DiffValidationError):
     """Raised when diff exceeds configured size, lines, or file limits."""
     pass
@@ -649,12 +667,86 @@ class DiffValidator:
             new_content += newline
         return ApplyHunksResult(True, new_content, None, None)
 
+    def resolve_target_content(
+        self,
+        file_path: str,
+        file_contents: Dict[str, str],
+        owner: Optional[str] = None,
+        repo: Optional[str] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Strictly resolves a patch target path to repository context content.
+
+        Returns (content, matched_key) or (None, None) when the path is genuinely
+        unknown (caller decides whether that is a new file/test).
+
+        Cross-repository safety:
+        - Paths are bound EXACTLY, or via an explicit active-repo prefix
+          ('repo/...' or 'owner/repo/...').
+        - A patch path carrying EXTRA leading segments that only match a context
+          key by trailing path (e.g. 'other-repo/src/x.py' vs 'src/x.py') is a
+          repository/patch mismatch and raises DiffBindingError. Target paths are
+          never silently rewritten to force a patch to apply.
+        """
+        if file_path in file_contents:
+            return file_contents[file_path], file_path
+
+        prefixes: List[str] = []
+        if repo:
+            prefixes.append(f"{repo}/")
+        if owner and repo:
+            prefixes.append(f"{owner}/{repo}/")
+        for prefix in prefixes:
+            if file_path.startswith(prefix):
+                candidate = file_path[len(prefix):]
+                if candidate in file_contents:
+                    return file_contents[candidate], candidate
+
+        # Benign layout case: the patch path is a suffix of a context key
+        # (e.g. patch 'app.py' vs context 'backend/app.py'). Only accept when
+        # exactly one context key matches, to avoid ambiguity.
+        suffix_matches = [k for k in file_contents if k.endswith("/" + file_path)]
+        if len(suffix_matches) == 1:
+            key = suffix_matches[0]
+            return file_contents[key], key
+        if len(suffix_matches) > 1:
+            raise DiffBindingError(
+                f"Patch target '{file_path}' ambiguously matches multiple context files "
+                f"({sorted(suffix_matches)}). Refusing to guess a repository binding.",
+                file=file_path,
+                details={"ambiguous_target": True, "candidates": sorted(suffix_matches)}
+            )
+
+        # Contamination case: the patch path has extra leading segments relative to
+        # the active repository's context files. This indicates the patch belongs to
+        # a different repository/run and must be rejected (never rewritten).
+        foreign_matches = [k for k in file_contents if file_path.endswith("/" + k)]
+        if foreign_matches:
+            active = f"{owner}/{repo}" if owner and repo else "the active repository"
+            raise DiffBindingError(
+                f"Patch target '{file_path}' does not belong to {active}; it only matches "
+                f"repository context file '{foreign_matches[0]}' by trailing path. "
+                f"Refusing to apply a patch generated for a different repository.",
+                file=file_path,
+                details={
+                    "repo_mismatch": True,
+                    "foreign_path": file_path,
+                    "context_file": foreign_matches[0],
+                    "active_owner": owner,
+                    "active_repo": repo,
+                }
+            )
+
+        return None, None
+
     def validate_and_apply(
         self,
         patch: str,
         file_contents: Dict[str, str],
         allowed_files: Optional[List[str]] = None,
-        expected_source_hashes: Optional[Dict[str, str]] = None
+        expected_source_hashes: Optional[Dict[str, str]] = None,
+        owner: Optional[str] = None,
+        repo: Optional[str] = None
     ) -> DiffValidationResult:
         """
         Performs end-to-end validation:
@@ -679,7 +771,11 @@ class DiffValidator:
                 file_diff = per_file_diffs.get(changed, "")
                 is_new_file = "--- /dev/null" in file_diff or "new file mode" in file_diff
                 is_ignore_file = basename_changed in (".gitignore", ".dockerignore")
-                if not is_new_file and not is_ignore_file and norm_changed not in allowed_normalized and basename_changed not in allowed_basenames:
+                is_test_file = (
+                    any(part in norm_changed.lower() for part in ("/test/", "/tests/", "/__tests__/", "test_", "_test.", ".test.", ".spec."))
+                    or norm_changed.lower().startswith("tests/") or norm_changed.lower().startswith("test/") or norm_changed.lower().startswith("__tests__/")
+                )
+                if not is_new_file and not is_ignore_file and not is_test_file and norm_changed not in allowed_normalized and basename_changed not in allowed_basenames:
                     raise DiffScopeError(
                         f"Patch modifies file '{changed}', which is not within investigated scope: {sorted(list(allowed_normalized))}"
                     )
@@ -690,18 +786,19 @@ class DiffValidator:
             if file_path == "/dev/null":
                 continue
 
-            # Target file content lookup
-            content = None
-            if file_path in file_contents:
-                content = file_contents[file_path]
-            else:
-                for k, v in file_contents.items():
-                    if k.endswith(file_path) or file_path.endswith(k) or re.split(r'[/]', k)[-1] == re.split(r'[/]', file_path)[-1]:
-                        content = v
-                        break
+            # Target file content lookup (strict repository binding; raises
+            # DiffBindingError for cross-repository path mismatches).
+            content, matched_key = self.resolve_target_content(
+                file_path, file_contents, owner=owner, repo=repo
+            )
 
             if content is None:
-                if "--- /dev/null" in file_diff:
+                is_new = "--- /dev/null" in file_diff or "new file mode" in file_diff
+                is_test = (
+                    any(part in file_path.lower().replace("\\", "/") for part in ("/test/", "/tests/", "/__tests__/", "test_", "_test.", ".test.", ".spec."))
+                    or file_path.lower().replace("\\", "/").startswith("tests/") or file_path.lower().replace("\\", "/").startswith("test/") or file_path.lower().replace("\\", "/").startswith("__tests__/")
+                )
+                if is_new or is_test:
                     content = ""
                 else:
                     raise DiffApplicationError(

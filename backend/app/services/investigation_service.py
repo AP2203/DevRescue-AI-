@@ -1,3 +1,4 @@
+import os
 import uuid
 import time
 import hashlib
@@ -6,6 +7,7 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 import logging
 
+from app.services.profiler import repo_profiler
 from app.services.risk_prediction_service import risk_service
 from app.schemas.risk import RiskFeatureInput
 from app.services.patch_feature_extractor import patch_feature_extractor
@@ -23,6 +25,7 @@ from app.services.github_service import (
     GitHubValidationError
 )
 from app.schemas.investigations import StageStatus
+from app.services.nemotron_service import _sanitize_error
 
 logger = logging.getLogger("devrescue.investigation")
 
@@ -67,6 +70,17 @@ class InvestigationService:
         self.investigation_runs: Dict[str, List[str]] = {}
         self.pull_requests: List[Dict[str, Any]] = []
         self.github_service = github_service
+        # Monotonic id allocator: guarantees unique investigation ids even after
+        # deletions or as concurrent requests interleave (avoids cross-run collisions).
+        self._inv_counter = 1
+
+    def _allocate_investigation_id(self) -> str:
+        """Allocates a monotonically increasing, collision-free investigation id."""
+        while True:
+            candidate = f"inv-{self._inv_counter}"
+            self._inv_counter += 1
+            if candidate not in self.investigations:
+                return candidate
 
     def list_investigations(self) -> List[Dict[str, Any]]:
         return list(self.investigations.values())
@@ -150,7 +164,9 @@ class InvestigationService:
         s2 = stages_by_key.get("repo_analysis", {})
         analyzer_status = "COMPLETE" if (s1.get("status") == "PASSED" and s2.get("status") == "PASSED") else (
             "ACTIVE" if (s1.get("status") == "RUNNING" or s2.get("status") == "RUNNING") else (
-                "FAILED" if (s1.get("status") == "FAILED" or s2.get("status") == "FAILED") else "PENDING"
+                "FAILED" if (s1.get("status") == "FAILED" or s2.get("status") == "FAILED") else (
+                    "SKIPPED" if (s1.get("status") == "SKIPPED" or s2.get("status") == "SKIPPED") else "PENDING"
+                )
             )
         )
 
@@ -161,12 +177,21 @@ class InvestigationService:
         s5 = stages_by_key.get("diff_validation", {})
         repair_status = "COMPLETE" if (s4.get("status") == "PASSED" and s5.get("status") == "PASSED") else (
             "ACTIVE" if (s4.get("status") == "RUNNING" or s5.get("status") == "RUNNING") else (
-                "FAILED" if (s4.get("status") == "FAILED" or s5.get("status") == "FAILED") else "PENDING"
+                "FAILED" if (s4.get("status") == "FAILED" or s5.get("status") == "FAILED") else (
+                    "SKIPPED" if (s4.get("status") == "SKIPPED" or s5.get("status") == "SKIPPED") else "PENDING"
+                )
             )
         )
 
+        s6 = stages_by_key.get("dependency_prep", {})
         s7 = stages_by_key.get("test_execution", {})
-        tester_status = map_status(s7.get("status"))
+        tester_status = "COMPLETE" if (s7.get("status") == "PASSED") else (
+            "ACTIVE" if (s6.get("status") == "RUNNING" or s7.get("status") == "RUNNING") else (
+                "FAILED" if (s6.get("status") in ("FAILED", "ENVIRONMENT_ERROR") or s7.get("status") in ("FAILED", "ENVIRONMENT_ERROR")) else (
+                    "SKIPPED" if (s6.get("status") == "SKIPPED" or s7.get("status") == "SKIPPED") else map_status(s7.get("status"))
+                )
+            )
+        )
 
         s8 = stages_by_key.get("security_review", {})
         security_status = map_status(s8.get("status"))
@@ -247,9 +272,12 @@ class InvestigationService:
         inv_id = run["investigation_id"]
         if inv_id in self.investigations:
             inv = self.investigations[inv_id]
-            inv["stages"] = run["stages"]
-            inv["agents"] = self._map_stages_to_agents(run)
-            inv["updated_at"] = now_iso
+            # Only mirror run state onto the investigation when this run is the
+            # active (latest) run, so a late older run cannot clobber it.
+            if inv.get("latest_run_id") in (None, run.get("run_id")):
+                inv["stages"] = run["stages"]
+                inv["agents"] = self._map_stages_to_agents(run)
+                inv["updated_at"] = now_iso
 
     def _log_run(
         self,
@@ -289,7 +317,7 @@ class InvestigationService:
         Stores GitHub connection metadata and initializes the primary execution run.
         """
         if not inv_id:
-            inv_id = f"inv-{len(self.investigations) + 1}"
+            inv_id = self._allocate_investigation_id()
         now_iso = datetime.utcnow().isoformat()
         now_str = datetime.utcnow().strftime("%H:%M:%S UTC")
 
@@ -392,6 +420,14 @@ class InvestigationService:
         issue_number = int(inv.get("issue_number") or inv.get("issueNumber") or 1)
         issue_title = inv.get("issue_title") or inv.get("issueTitle") or "Reported Bug"
 
+        # Isolation guard: only the active (latest) run may mutate the shared
+        # investigation state. This prevents a late-finishing older run from
+        # overwriting the active investigation's results/status (run-level data
+        # stays in `run`, which is keyed by run_id and never shared).
+        def _set_inv(key: str, value: Any) -> None:
+            if inv.get("latest_run_id") in (None, run_id):
+                inv[key] = value
+
         try:
             # Stage 1: Repository & Issue Retrieval
             run["current_stage_key"] = "repo_retrieval"
@@ -403,9 +439,9 @@ class InvestigationService:
                     issue_data = await github_service.get_issue(access_token, owner, repo_name, issue_number)
                     if issue_data.get("title"):
                         issue_title = issue_data["title"]
-                        inv["issue_title"] = issue_title
-                        inv["issueTitle"] = issue_title
-                        inv["error_description"] = issue_data.get("body", "")
+                        _set_inv("issue_title", issue_title)
+                        _set_inv("issueTitle", issue_title)
+                        _set_inv("error_description", issue_data.get("body", ""))
             except Exception as e:
                 logger.warning(f"[STAGE 1] Issue query warning: {e}")
 
@@ -416,8 +452,32 @@ class InvestigationService:
             run["current_stage_key"] = "repo_analysis"
             self._update_stage(run, "repo_analysis", StageStatus.RUNNING.value)
             self._log_run(run, "repo_analysis", "Repository Analyzer", f"Analyzing code structure and candidate files for {owner}/{repo_name}...")
+
+            # Profile repository structure, manifests, and test configurations
+            repo_profile_data = None
+            try:
+                local_repo_dir = getattr(github_service, "get_local_repo_dir", lambda o, r: None)(owner, repo_name)
+                if local_repo_dir and os.path.isdir(local_repo_dir):
+                    profile = repo_profiler.profile_repository(local_repo_dir)
+                    repo_profile_data = profile.model_dump()
+                    run["repo_profile"] = repo_profile_data
+                    _set_inv("repo_profile", repo_profile_data)
+                    try:
+                        initial_strategy = repo_profiler.evaluate_test_strategy(local_repo_dir, [])
+                        strat_data = initial_strategy.model_dump()
+                        run["test_strategy"] = strat_data
+                        _set_inv("test_strategy", strat_data)
+                    except Exception as se:
+                        logger.debug(f"[STAGE 2] Strategy evaluation note: {se}")
+                    self._log_run(run, "repo_analysis", "Repository Analyzer", f"Profiled repository: {len(profile.subprojects)} subproject(s), primary language: {profile.primary_language}.")
+            except Exception as pe:
+                logger.debug(f"[STAGE 2] Profiling note: {pe}")
+
             await asyncio.sleep(0.5)
-            self._update_stage(run, "repo_analysis", StageStatus.PASSED.value, summary="AST structure and candidate source modules parsed.")
+            analysis_summary = "AST structure and candidate source modules parsed."
+            if repo_profile_data and repo_profile_data.get("subprojects"):
+                analysis_summary = f"Profiled {len(repo_profile_data['subprojects'])} subproject(s); primary language: {repo_profile_data.get('primary_language', 'unknown')}."
+            self._update_stage(run, "repo_analysis", StageStatus.PASSED.value, summary=analysis_summary, details=repo_profile_data or {})
 
             # Stage 3: Root Cause Diagnosis (Nemotron)
             run["current_stage_key"] = "root_cause"
@@ -434,7 +494,7 @@ class InvestigationService:
             )
             inv_res_dict = inv_res.model_dump()
             run["root_cause"] = inv_res_dict
-            inv["rootCause"] = inv_res_dict
+            _set_inv("rootCause", inv_res_dict)
             self._update_stage(run, "root_cause", StageStatus.PASSED.value, summary=f"Root cause isolated ({round(inv_res.confidence * 100)}% confidence)", details=inv_res_dict)
             self._log_run(run, "root_cause", "Bug Investigator", f"Root cause diagnosed: {inv_res.root_cause[:120]} (Confidence: {round(inv_res.confidence * 100)}%).")
 
@@ -450,24 +510,58 @@ class InvestigationService:
                 issue_number=issue_number,
                 investigation=inv_res,
                 branch=branch,
-                access_token=access_token
+                access_token=access_token,
+                test_strategy=run.get("test_strategy") or inv.get("test_strategy"),
+                repo_profile=run.get("repo_profile") or inv.get("repo_profile"),
+                investigation_id=inv_id,
+                run_id=run_id
             )
             patch_res_dict = patch_res.model_dump()
             run["patch"] = patch_res_dict
-            inv["patch"] = patch_res_dict
+            _set_inv("patch", patch_res_dict)
             self._update_stage(run, "patch_synthesis", StageStatus.PASSED.value, summary=f"Unified diff generated: {', '.join(patch_res.files_changed)}", details=patch_res_dict)
             self._log_run(run, "patch_synthesis", "Code Repair Agent", f"Synthesized unified diff for: {', '.join(patch_res.files_changed)} (+{patch_res.lines_added}/-{patch_res.lines_removed}).")
 
-            # Stage 5: Diff Validation & Safe Patch Application
+            # Stage 5: Diff Validation & Safe Patch Application (with self-healing retry)
             run["current_stage_key"] = "diff_validation"
             self._update_stage(run, "diff_validation", StageStatus.RUNNING.value)
             self._log_run(run, "diff_validation", "Code Repair Agent", "Validating diff structure, safety limits, and computing patch SHA-256 hash...")
 
             patch_text = patch_res.patch
-            files_changed, lines_added, lines_removed = diff_validator.validate_syntax_and_limits(patch_text)
-            patch_hash = hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
-            run["patch"]["patch_hash"] = patch_hash
-            inv["patch"]["patch_hash"] = patch_hash
+            diff_retries = 0
+            MAX_DIFF_RETRIES = 2
+            while diff_retries <= MAX_DIFF_RETRIES:
+                try:
+                    files_changed, lines_added, lines_removed = diff_validator.validate_syntax_and_limits(patch_text)
+                    patch_hash = hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
+                    run["patch"]["patch_hash"] = patch_hash
+                    _set_inv("patch", run["patch"])
+                    break
+                except (DiffValidationError, ValueError) as dve:
+                    diff_retries += 1
+                    if diff_retries > MAX_DIFF_RETRIES:
+                        raise
+                    self._log_run(run, "diff_validation", "Code Repair Agent", f"[SELF-HEALING RETRY {diff_retries}/{MAX_DIFF_RETRIES}] Diff syntax validation error: {dve}. Requesting corrected diff from Nemotron...")
+                    revised_inv_dict = {
+                        **inv_res_dict,
+                        "root_cause": f"{inv_res.root_cause}\n\nPREVIOUS PATCH DIFF SYNTAX ERROR:\n{dve}\nPlease provide a strictly formatted unified diff matching '--- a/path' and '+++ b/path'."
+                    }
+                    from app.schemas.nemotron import NemotronInvestigateResponse
+                    revised_inv_obj = NemotronInvestigateResponse(**revised_inv_dict)
+                    patch_res = await patch_service.synthesize_patch(
+                        owner=owner,
+                        repo=repo_name,
+                        issue_number=issue_number,
+                        investigation=revised_inv_obj,
+                        branch=branch,
+                        access_token=access_token,
+                        investigation_id=inv_id,
+                        run_id=run_id
+                    )
+                    patch_text = patch_res.patch
+                    patch_res_dict = patch_res.model_dump()
+                    run["patch"] = patch_res_dict
+                    _set_inv("patch", patch_res_dict)
 
             self._update_stage(run, "diff_validation", StageStatus.PASSED.value, summary=f"Diff validated: {len(files_changed)} file(s), SHA-256: {patch_hash[:10]}...", details={"patch_hash": patch_hash, "files_changed": files_changed})
             self._log_run(run, "diff_validation", "Code Repair Agent", f"Patch validation passed. SHA-256: {patch_hash}.")
@@ -490,23 +584,43 @@ class InvestigationService:
                 branch=branch,
                 issue_number=issue_number,
                 patch=patch_text,
-                access_token=access_token
+                access_token=access_token,
+                binding=run["patch"].get("binding")
             )
             test_dict = test_res.model_dump()
             run["sandbox_result"] = test_dict
-            inv["sandboxResult"] = test_dict
+            _set_inv("sandboxResult", test_dict)
+            # Bind the exact base commit used by the sandbox checkout to the patch.
+            if test_dict.get("base_commit") and isinstance(run.get("patch"), dict):
+                run["patch"].setdefault("binding", {})
+                run["patch"]["binding"]["base_commit"] = test_dict["base_commit"]
+                _set_inv("patch", run["patch"])
 
             # Bounded Repair Retry Loop (up to 2 retries)
             repair_retries = 0
             MAX_REPAIRS = 2
             current_patch_text = patch_text
-            while test_res.status not in ("PASSED", "TESTS_NOT_CONFIGURED") and repair_retries < MAX_REPAIRS:
+            retry_history = []
+            while test_res.status not in ("PASSED", "TESTS_NOT_CONFIGURED", "NO_TESTS_FOUND", "UNSUPPORTED_PROJECT") and repair_retries < MAX_REPAIRS:
                 repair_retries += 1
-                self._log_run(run, "test_execution", "SYS", f"[REPAIR RETRY {repair_retries}/{MAX_REPAIRS}] Tests returned {test_res.status}. Feeding failure traceback to Nemotron...")
+                retry_entry = {
+                    "attempt": repair_retries,
+                    "previous_status": test_res.status,
+                    "exit_code": test_res.exit_code,
+                    "failure_traceback": (test_res.stderr or test_res.stdout or "")[-1000:],
+                    "patch_hash": hashlib.sha256(current_patch_text.encode("utf-8")).hexdigest()
+                }
+                retry_history.append(retry_entry)
+                run["retry_history"] = retry_history
+                _set_inv("retryHistory", retry_history)
+                run["repair_retries"] = repair_retries
+                _set_inv("repairRetries", repair_retries)
+
+                self._log_run(run, "test_execution", "SYS", f"[REPAIR RETRY {repair_retries}/{MAX_REPAIRS}] Tests returned {test_res.status} (exit code: {test_res.exit_code}). Feeding failure traceback to Nemotron...")
                 try:
                     revised_inv_dict = {
                         **inv_res_dict,
-                        "root_cause": f"{inv_res.root_cause}\n\nPREVIOUS TEST FAILURE ({test_res.status}):\n{(test_res.stderr or test_res.stdout or '')[-2500:]}"
+                        "root_cause": f"{inv_res.root_cause}\n\nPREVIOUS TEST FAILURE ({test_res.status}, exit code: {test_res.exit_code}):\n{(test_res.stderr or test_res.stdout or '')[-2500:]}\nPlease fix the failing assertions or import issues in the unified diff."
                     }
                     from app.schemas.nemotron import NemotronInvestigateResponse
                     revised_inv_obj = NemotronInvestigateResponse(**revised_inv_dict)
@@ -516,37 +630,69 @@ class InvestigationService:
                         issue_number=issue_number,
                         investigation=revised_inv_obj,
                         branch=branch,
-                        access_token=access_token
+                        access_token=access_token,
+                        investigation_id=inv_id,
+                        run_id=run_id
                     )
-                    current_patch_text = revised_patch.patch
+                    # Validate revised patch diff syntax before re-running sandbox
+                    revised_patch_text = revised_patch.patch
+                    diff_validator.validate_syntax_and_limits(revised_patch_text)
+                    current_patch_text = revised_patch_text
                     current_patch_hash = hashlib.sha256(current_patch_text.encode("utf-8")).hexdigest()
+
                     run["patch"] = revised_patch.model_dump()
                     run["patch"]["patch_hash"] = current_patch_hash
-                    inv["patch"] = run["patch"]
+                    _set_inv("patch", run["patch"])
 
-                    self._log_run(run, "test_execution", "Code Repair Agent", f"Synthesized revised patch (+{revised_patch.lines_added}/-{revised_patch.lines_removed}). Retesting in sandbox...")
+                    self._log_run(run, "test_execution", "Code Repair Agent", f"Synthesized revised patch (+{revised_patch.lines_added}/-{revised_patch.lines_removed}) [SHA-256: {current_patch_hash[:10]}]. Retesting in sandbox...")
                     test_res = await sandbox_service.execute_sandbox_test(
                         owner=owner,
                         repo=repo_name,
                         branch=branch,
                         issue_number=issue_number,
                         patch=current_patch_text,
-                        access_token=access_token
+                        access_token=access_token,
+                        binding=run["patch"].get("binding")
                     )
                     test_dict = test_res.model_dump()
                     run["sandbox_result"] = test_dict
-                    inv["sandboxResult"] = test_dict
+                    _set_inv("sandboxResult", test_dict)
+                    if test_dict.get("base_commit") and isinstance(run.get("patch"), dict):
+                        run["patch"].setdefault("binding", {})
+                        run["patch"]["binding"]["base_commit"] = test_dict["base_commit"]
+                        _set_inv("patch", run["patch"])
                 except Exception as retry_err:
                     self._log_run(run, "test_execution", "SYS", f"Repair retry synthesis aborted: {retry_err}", level="WARNING")
                     break
 
             # Classify final test stage outcome
+            is_synthesized_verified = bool(getattr(test_res, "verified_via_synthesized_test", False))
+            if is_synthesized_verified:
+                run["verified_via_synthesized_test"] = True
+                _set_inv("verified_via_synthesized_test", True)
+                _set_inv("verifiedViaSynthesizedTest", True)
+
             if test_res.status == "PASSED":
-                self._update_stage(run, "test_execution", StageStatus.PASSED.value, summary=f"Tests PASSED: {test_res.tests_passed or 'All'} passed in {test_res.duration_seconds}s", details=test_dict)
-                self._log_run(run, "test_execution", "Testing Agent", f"Tests passed: {test_res.tests_passed} passed.")
+                summary_text = f"Tests PASSED: {test_res.tests_passed or 'All'} passed in {test_res.duration_seconds}s"
+                if is_synthesized_verified:
+                    summary_text += " [Verified via AI-Synthesized Test]"
+                self._update_stage(run, "test_execution", StageStatus.PASSED.value, summary=summary_text, details=test_dict)
+                self._log_run(run, "test_execution", "Testing Agent", f"Tests passed: {test_res.tests_passed} passed." + (" (Verified via AI-synthesized unit test)" if is_synthesized_verified else ""))
             elif test_res.status == "TESTS_NOT_CONFIGURED":
-                self._update_stage(run, "test_execution", StageStatus.SKIPPED.value, summary="No tests configured for target files", details=test_dict)
-                self._log_run(run, "test_execution", "Testing Agent", "No tests collected or configured.")
+                self._update_stage(run, "test_execution", StageStatus.SKIPPED.value, summary="No test suite configured in repository", details=test_dict)
+                self._log_run(run, "test_execution", "Testing Agent", "No test suite configured in repository.")
+            elif test_res.status == "NO_TESTS_FOUND":
+                self._update_stage(run, "test_execution", StageStatus.SKIPPED.value, summary="Configured test runner found no matching test files", details=test_dict)
+                self._log_run(run, "test_execution", "Testing Agent", "Test runner executed but found zero matching test files.")
+            elif test_res.status == "UNSUPPORTED_PROJECT":
+                self._update_stage(run, "test_execution", StageStatus.SKIPPED.value, summary=f"Unsupported project: {test_res.message or 'Ecosystem unsupported'}", details=test_dict)
+                self._log_run(run, "test_execution", "Testing Agent", f"Project ecosystem unsupported: {test_res.message}")
+            elif test_res.status == "TEST_COLLECTION_ERROR":
+                self._update_stage(run, "test_execution", StageStatus.FAILED.value, summary=f"Test collection or configuration error: {test_res.message.splitlines()[0] if test_res.message else 'Collection error'}", details=test_dict)
+                self._log_run(run, "test_execution", "Testing Agent", f"Test collection error: {test_res.message}", level="ERROR")
+            elif test_res.status == "TIMEOUT":
+                self._update_stage(run, "test_execution", StageStatus.FAILED.value, summary=f"Test execution timed out after {test_res.duration_seconds}s", details=test_dict)
+                self._log_run(run, "test_execution", "Testing Agent", "Test execution timed out.", level="ERROR")
             elif test_res.status == "ENVIRONMENT_ERROR":
                 self._update_stage(run, "test_execution", StageStatus.ENVIRONMENT_ERROR.value, summary=f"Environment import error: {test_res.message.splitlines()[0] if test_res.message else 'Module missing'}", details=test_dict)
                 self._log_run(run, "test_execution", "Testing Agent", f"Environment error: {test_res.message}", level="ERROR")
@@ -564,7 +710,7 @@ class InvestigationService:
 
             sec_res = security_service.scan_patch(run["patch"].get("patch", ""))
             run["security_result"] = sec_res
-            inv["securityResult"] = sec_res
+            _set_inv("securityResult", sec_res)
 
             if sec_res["status"] == "PASSED":
                 self._update_stage(run, "security_review", StageStatus.PASSED.value, summary=sec_res["summary"], details=sec_res)
@@ -598,8 +744,10 @@ class InvestigationService:
                 features_input = RiskFeatureInput(**feats_dict)
                 risk_pred = risk_service.predict(features_input)
                 risk_dump = risk_pred.model_dump()
+                if is_synthesized_verified:
+                    risk_dump["verified_via_synthesized_test"] = True
                 run["risk_assessment"] = risk_dump
-                inv["riskAssessment"] = risk_dump
+                _set_inv("riskAssessment", risk_dump)
                 self._update_stage(run, "risk_assessment", StageStatus.PASSED.value, summary=f"XGBoost risk: {risk_pred.risk_level} (confidence: {risk_pred.confidence_score})", details=risk_dump)
                 self._log_run(run, "risk_assessment", "Risk Evaluator", f"Assessed risk: {risk_pred.risk_level} (Score: {risk_pred.risk_score}).")
             except Exception as ml_err:
@@ -608,37 +756,75 @@ class InvestigationService:
 
             # Stage 10: Human Review & Approval Gate (Stays PENDING awaiting user action)
             run["current_stage_key"] = "human_approval"
-            self._update_stage(run, "human_approval", StageStatus.PENDING.value, summary="Awaiting maintainer review and approval")
+            approval_summary = "Awaiting maintainer review and approval"
+            if is_synthesized_verified:
+                approval_summary += " (verified via AI-synthesized unit test)"
+            approval_details = {"verified_via_synthesized_test": True} if is_synthesized_verified else {}
+            self._update_stage(run, "human_approval", StageStatus.PENDING.value, summary=approval_summary, details=approval_details)
             self._log_run(run, "human_approval", "SYS", "Automated checks finished. Awaiting required human approval gate.")
 
             # Stage 11: GitHub PR Dispatch (Stays PENDING awaiting approval)
             run["current_stage_key"] = "pr_dispatch"
             self._update_stage(run, "pr_dispatch", StageStatus.PENDING.value, summary="Awaiting approval gate")
 
-            # Finalize Run Status
+            # Finalize Run Status (guarded so a late older run cannot clobber the active run).
+            # A required stage failing (tests or security) must NEVER yield a success state.
+            test_ok = test_res.status == "PASSED"
+            test_skipped = test_res.status in (
+                "NO_TESTS_FOUND", "TESTS_NOT_CONFIGURED", "UNSUPPORTED_PROJECT"
+            )
+            test_hard_failure = test_res.status in (
+                "FAILED", "TESTS_FAILED", "TIMEOUT", "DEPENDENCIES_UNAVAILABLE",
+                "TEST_COLLECTION_ERROR", "PATCH_FAILED", "DOCKER_UNAVAILABLE", "ERROR",
+            )
             if test_res.status == "ENVIRONMENT_ERROR":
                 run["status"] = StageStatus.ENVIRONMENT_ERROR.value
-                inv["status"] = "FAILED"
-                inv["progress"] = 75
-            elif test_res.status == "FAILED" or sec_res["status"] == "FAILED":
+                _set_inv("status", "FAILED")
+                _set_inv("progress", 75)
+            elif sec_res["status"] == "FAILED" or test_hard_failure or not (test_ok or test_skipped):
                 run["status"] = StageStatus.FAILED.value
-                inv["status"] = "FAILED"
-                inv["progress"] = 75
-            else:
+                _set_inv("status", "FAILED")
+                _set_inv("progress", 75)
+            elif test_ok:
                 run["status"] = StageStatus.PASSED.value
-                inv["status"] = "READY_FOR_REVIEW"
-                inv["progress"] = 100
+                _set_inv("status", "READY_FOR_REVIEW")
+                _set_inv("progress", 100)
+            else:
+                # Tests were skipped (no runnable tests): partial completion, human review required.
+                run["status"] = StageStatus.PASSED.value
+                _set_inv("status", "READY_FOR_REVIEW")
+                _set_inv("progress", 90)
 
         except Exception as top_err:
-            logger.error(f"[STAGED_RUN ERROR] Run {run_id} encountered fatal exception: {top_err}", exc_info=True)
+            safe_err = _sanitize_error(top_err)
+            logger.error(f"[STAGED_RUN ERROR] Run {run_id} encountered fatal exception: {safe_err}", exc_info=True)
+            current_stage_key = run.get("current_stage_key", "root_cause")
+
+            # 1. Update the failing stage
+            self._update_stage(
+                run,
+                current_stage_key,
+                StageStatus.FAILED.value,
+                summary=f"Failed: {safe_err}"
+            )
+
+            # 2. Mark all downstream stages as SKIPPED
+            failed_stage_id = next((s["id"] for s in run.get("stages", []) if s["key"] == current_stage_key), 3)
+            for s in run.get("stages", []):
+                if s["id"] > failed_stage_id:
+                    s["status"] = StageStatus.SKIPPED.value
+                    s["summary"] = f"Skipped due to upstream failure in {current_stage_key}"
+
             run["status"] = StageStatus.FAILED.value
-            run["error_summary"] = str(top_err)
-            inv["status"] = "FAILED"
-            inv["error_summary"] = str(top_err)
-            self._log_run(run, "SYS", "SYS", f"Fatal execution error: {str(top_err)}", level="ERROR")
+            run["error_summary"] = safe_err
+            _set_inv("status", "FAILED")
+            _set_inv("error_summary", safe_err)
+            _set_inv("stages", run["stages"])
+            _set_inv("agents", self._map_stages_to_agents(run))
+            self._log_run(run, current_stage_key, "SYS", f"Fatal execution error: {safe_err}", level="ERROR")
 
         run["updated_at"] = datetime.utcnow().isoformat()
-        inv["updated_at"] = datetime.utcnow().isoformat()
+        _set_inv("updated_at", datetime.utcnow().isoformat())
         return run
 
     async def create_investigation(
@@ -653,7 +839,7 @@ class InvestigationService:
         """
         Orchestrates legacy direct pipeline for backward compatibility.
         """
-        inv_id = f"inv-{len(self.investigations) + 1}"
+        inv_id = self._allocate_investigation_id()
         run = self.create_run_record(inv_id, retry_count=0)
 
         now_str = datetime.utcnow().strftime("%H:%M:%S UTC")
@@ -856,14 +1042,35 @@ class InvestigationService:
         if patch_hash and patch_hash != expected_hash:
             raise ValueError(f"Approval rejected: patch hash mismatch (received {patch_hash}, expected {expected_hash}). Stale approval token.")
 
-        # Record Approval Gate
+        # Enforce repository binding: approval cannot cross repositories, and the
+        # approved diff must match the validated patch artifact hash.
+        binding = patch_info.get("binding") or {}
+        bound_repo = None
+        if binding.get("owner") and binding.get("repo"):
+            bound_repo = f"{binding.get('owner')}/{binding.get('repo')}"
+            inv_repo = inv.get("repository") or inv.get("repo")
+            if inv_repo and inv_repo != bound_repo:
+                raise ValueError(
+                    f"Approval rejected: patch is bound to repository '{bound_repo}' "
+                    f"but the investigation repository is '{inv_repo}'."
+                )
+        if binding.get("patch_sha256") and binding["patch_sha256"] != expected_hash:
+            raise ValueError(
+                "Approval rejected: patch content hash does not match the validated binding "
+                "hash (stale or tampered patch artifact)."
+            )
+
+        # Record Approval Gate (bound to exact run, repository, base commit, patch hash)
         now_iso = datetime.utcnow().isoformat()
         now_str = datetime.utcnow().strftime("%H:%M:%S UTC")
         run["approval"] = {
             "approved": True,
             "approved_at": now_iso,
             "run_id": run_id,
-            "patch_hash": expected_hash
+            "patch_hash": expected_hash,
+            "repository": bound_repo,
+            "base_commit": binding.get("base_commit"),
+            "binding": binding
         }
         self._update_stage(run, "human_approval", StageStatus.PASSED.value, summary=f"Approved by human reviewer at {now_str}", details=run["approval"])
         self._log_run(run, "human_approval", "Maintainer Review", f"Human engineer approved fix (Run: {run_id}, Hash: {expected_hash[:10]}...).")

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams } from 'react-router-dom';
-import { AlertCircle, RefreshCw, ShieldCheck, Sparkles, FileCode } from 'lucide-react';
+import { AlertCircle, RefreshCw, ShieldCheck, Sparkles } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import Button from '../../components/common/Button';
 import { ConfirmDialog } from '../../components/common/Modal';
@@ -33,7 +33,11 @@ export default function LiveInvestigation() {
   const [errorStatus, setErrorStatus] = useState(null);
   const [patchErrorDetails, setPatchErrorDetails] = useState(null);
   const [dockerStatus, setDockerStatus] = useState(null);
+  const [failureInfo, setFailureInfo] = useState(null);
   const executedTracker = useRef(new Set());
+  // Monotonic token identifying the currently active run. Async responses from an
+  // older run are ignored so they cannot overwrite the current run's state.
+  const activeRunTokenRef = useRef(0);
 
   const isRealMode = (inv?.mode?.toUpperCase() === 'REAL') || (appMode === 'REAL');
 
@@ -43,6 +47,7 @@ export default function LiveInvestigation() {
     setInvestigationError(null);
     setErrorStatus(null);
     setPatchErrorDetails(null);
+    setFailureInfo(null);
   }
 
   // Real Mode: Query backend status or sync existing
@@ -105,9 +110,14 @@ export default function LiveInvestigation() {
   const runRealInvestigation = useCallback(async (overrideRunId = null) => {
     if (!inv) return;
 
+    const runToken = ++activeRunTokenRef.current;
+    const isStale = () => activeRunTokenRef.current !== runToken;
+    const runStartedAt = Date.now();
+
     const currentRunId = overrideRunId || inv?.latest_run_id || `run_${id}_${Date.now()}`;
 
-    // Extract repository details
+    // Extract repository details. This MUST be explicitly bound; we never default to
+    // another repository, since that would contaminate results across investigations.
     let owner = inv.owner;
     let repoName = inv.repo_name;
     const rawRepo = inv.repo || inv.repository || '';
@@ -116,15 +126,25 @@ export default function LiveInvestigation() {
       owner = owner || parts[0];
       repoName = repoName || parts[1];
     } else {
-      repoName = repoName || rawRepo || '2D2Mesh';
+      repoName = repoName || rawRepo || '';
     }
-    owner = owner || 'anshpatel2212';
     const branch = inv.branch || 'main';
     const issueNumber = Number(inv.issue_number || inv.issueNumber || 1);
+
+    if (!owner || !repoName) {
+      setIsInvestigating(false);
+      const msg = 'Repository binding is missing (owner/repo). Refusing to run to avoid cross-repository contamination. Please re-select the issue.';
+      setErrorStatus(409);
+      setInvestigationError(msg);
+      setFailureInfo({ stage: 'Repository Retrieval', message: msg, retryable: false, runId: currentRunId, elapsedSeconds: 0 });
+      addNotification(msg, 'error');
+      return;
+    }
 
     setIsInvestigating(true);
     setInvestigationError(null);
     setPatchErrorDetails(null);
+    setFailureInfo(null);
     setErrorStatus(null);
 
     const nowStr = new Date().toLocaleTimeString();
@@ -203,6 +223,7 @@ export default function LiveInvestigation() {
       };
 
       const res = await api.investigateNemotron(payload);
+      if (isStale()) return;
 
       const filesAnalyzedList = (res.files_analyzed || []).map((f) => f.path);
       const invRes = res.investigation || {};
@@ -279,6 +300,7 @@ export default function LiveInvestigation() {
         issue_number: issueNumber,
         investigation: invRes
       });
+      if (isStale()) return;
 
       const patchDoneAgents = [
         {
@@ -358,22 +380,31 @@ export default function LiveInvestigation() {
             repo: repoName,
             branch,
             issue_number: issueNumber,
-            patch: currentPatchRes.patch
+            patch: currentPatchRes.patch,
+            binding: currentPatchRes.binding || null
           });
         } catch (testErr) {
+          // A transport failure is NEVER a "test result". Classify it honestly
+          // so the UI shows the real failed stage instead of a fake success.
           console.warn('Sandbox testing request error:', testErr);
+          const isTransportTimeout = testErr?.isTimeout || testErr?.errorCode === 'REQUEST_TIMEOUT';
+          const isNetworkFailure = testErr?.isNetworkError || testErr?.errorCode === 'NETWORK_ERROR';
           sandboxRes = {
             success: false,
-            status: 'ERROR',
-            message: testErr.message || 'Sandbox test invocation failed',
+            status: isTransportTimeout ? 'TIMEOUT' : 'ERROR',
+            message: testErr?.message || 'Sandbox test invocation failed',
             exit_code: 1,
             stdout: '',
-            stderr: testErr.message || 'Execution error'
+            stderr: testErr?.message || 'Execution error',
+            transport_failure: isNetworkFailure || isTransportTimeout
           };
         }
 
         isTestPassed = sandboxRes?.status === 'PASSED';
-        if (isTestPassed || sandboxRes?.status === 'TESTS_NOT_CONFIGURED' || repairAttempt >= MAX_REPAIR_RETRIES) {
+        // Only a genuine test failure warrants a repair retry; transport errors,
+        // build/dependency errors and zero-test outcomes are terminal for this run.
+        const isRetryableTestFailure = sandboxRes?.status === 'FAILED' || sandboxRes?.status === 'TESTS_FAILED';
+        if (isTestPassed || !isRetryableTestFailure || repairAttempt >= MAX_REPAIR_RETRIES) {
           break;
         }
 
@@ -421,12 +452,16 @@ export default function LiveInvestigation() {
         }
       }
 
+      if (isStale()) return;
+
       const isPatchFailedInSandbox = sandboxRes?.status === 'PATCH_FAILED';
-      const isSandboxFailed = !isTestPassed && sandboxRes?.status !== 'TESTS_NOT_CONFIGURED';
+      const skippedStatuses = ['TESTS_NOT_CONFIGURED', 'NO_TESTS_FOUND', 'UNSUPPORTED_PROJECT'];
+      const isSandboxSkipped = skippedStatuses.includes(sandboxRes?.status);
+      const isSandboxFailed = !isTestPassed && !isSandboxSkipped;
 
       const testingStatus = isTestPassed
         ? 'COMPLETE'
-        : (sandboxRes?.status === 'TESTS_NOT_CONFIGURED')
+        : isSandboxSkipped
         ? 'SKIPPED'
         : 'FAILED';
 
@@ -434,6 +469,14 @@ export default function LiveInvestigation() {
         ? `Tests passed: ${sandboxRes.tests_passed ?? 'All'}/${sandboxRes.tests_run ?? sandboxRes.tests_passed ?? 'All'} (${sandboxRes.duration_seconds || 1}s)`
         : sandboxRes?.status === 'TESTS_NOT_CONFIGURED'
         ? 'No test suite configured for this component'
+        : sandboxRes?.status === 'NO_TESTS_FOUND'
+        ? 'Test runner executed but found no matching tests'
+        : sandboxRes?.status === 'UNSUPPORTED_PROJECT'
+        ? 'Repository language or build system is not supported for isolated execution'
+        : sandboxRes?.status === 'TEST_COLLECTION_ERROR'
+        ? `Test collection error: ${(sandboxRes?.message || 'Test discovery failed').split('\n')[0]}`
+        : sandboxRes?.status === 'TIMEOUT'
+        ? `Test execution timed out: ${(sandboxRes?.message || 'Execution exceeded time limit').split('\n')[0]}`
         : sandboxRes?.status === 'ENVIRONMENT_ERROR'
         ? `Environment error: ${(sandboxRes?.message || 'Application import or conftest error').split('\n')[0]}`
         : sandboxRes?.status === 'DEPENDENCIES_UNAVAILABLE'
@@ -583,12 +626,24 @@ export default function LiveInvestigation() {
         lines_removed: currentPatchRes.lines_removed || 0,
         diff: currentPatchRes.patch,
         explanation: currentPatchRes.explanation || invRes.proposed_fix,
-        validation: currentPatchRes.validation || { is_valid: !isPatchFailedInSandbox, clean_application: !isPatchFailedInSandbox }
+        validation: currentPatchRes.validation || { is_valid: !isPatchFailedInSandbox, clean_application: !isPatchFailedInSandbox },
+        binding: currentPatchRes.binding || null
       };
 
       const isSecurityFailed = secRes?.status === 'FAILED';
-      const finalStatus = isPatchFailedInSandbox || isSandboxFailed || isSecurityFailed ? 'FAILED' : 'COMPLETE';
-      const finalProgress = isPatchFailedInSandbox ? 75 : 100;
+      // Overall status is derived from the required stages — never from a raw
+      // progress counter. Testing must genuinely pass for the run to be COMPLETE.
+      let finalStatus;
+      if (isPatchFailedInSandbox || isSandboxFailed || isSecurityFailed) {
+        finalStatus = 'FAILED';
+      } else if (isTestPassed) {
+        finalStatus = 'COMPLETE';
+      } else if (isSandboxSkipped) {
+        finalStatus = 'READY_FOR_REVIEW'; // partial: no tests to run, needs human review
+      } else {
+        finalStatus = 'FAILED';
+      }
+      const finalProgress = finalStatus === 'COMPLETE' ? 100 : (finalStatus === 'READY_FOR_REVIEW' ? 90 : (isPatchFailedInSandbox ? 75 : 80));
 
       const completedInv = {
         ...inv,
@@ -654,6 +709,7 @@ export default function LiveInvestigation() {
       }
     } catch (err) {
       console.error('[DevRescue REAL Pipeline Error]', err);
+      if (isStale()) return;
       setIsInvestigating(false);
       const status = err.status || 500;
       setErrorStatus(status);
@@ -670,9 +726,15 @@ export default function LiveInvestigation() {
         errData.error === 'invalid_patch' ||
         errData.status === 'INVALID_PATCH' ||
         errData.error === 'diff_validation_error';
+      const isNetworkError = err.errorCode === 'NETWORK_ERROR' || err.isNetworkError === true;
+      const isRequestTimeout = err.errorCode === 'REQUEST_TIMEOUT' || err.isTimeout === true;
 
       let msg = errData.message || err.message || 'Pipeline failed.';
-      if (isPatchAppFailed) {
+      if (isNetworkError) {
+        msg = err.message || 'Cannot reach the DevRescue backend. Ensure the API server is running and CORS is configured.';
+      } else if (isRequestTimeout) {
+        msg = err.message || 'The backend request timed out. The operation is unconfirmed and must be retried.';
+      } else if (isPatchAppFailed) {
         const failurePrefix = (errData.status === 'INVALID_PATCH' || errData.error === 'invalid_patch') ? 'Patch validation failed' : 'Patch application failed';
         msg = `${failurePrefix} on '${errData.file || 'target file'}'${errData.hunk ? ` (Hunk #${errData.hunk})` : ''}: ${errData.message || err.message}`;
       } else if (status === 401) {
@@ -688,6 +750,24 @@ export default function LiveInvestigation() {
       setInvestigationError(msg);
       setPatchErrorDetails(isPatchAppFailed ? errData : null);
       addNotification(msg, 'error');
+
+      const failedStageName = isNetworkError || isRequestTimeout
+        ? 'Backend Connection'
+        : isGitHubError
+        ? 'Repository Retrieval'
+        : isPatchAppFailed
+        ? 'Patch Synthesis'
+        : (isTimeout || isRateLimited)
+        ? 'Root Cause Diagnosis (Nemotron)'
+        : 'Bug Investigator';
+      setFailureInfo({
+        stage: failedStageName,
+        message: msg,
+        errorCode: typeof errorCode === 'string' && errorCode ? errorCode : (err.errorCode || null),
+        retryable: Boolean(isNetworkError || isRequestTimeout || isTimeout || isRateLimited || (isPatchAppFailed && errData.retry_available) || status >= 500),
+        runId: currentRunId,
+        elapsedSeconds: ((Date.now() - runStartedAt) / 1000).toFixed(1)
+      });
 
       const failedAgents = liveAgents.map((a) => {
         if (isPatchAppFailed) {
@@ -807,20 +887,23 @@ export default function LiveInvestigation() {
         }
       ];
 
-      setInv((prev) => ({
-        ...prev,
+      const failedInv = {
         status: 'FAILED',
         progress: isPatchAppFailed ? 65 : 40,
         agents: failedAgents,
         logs: failedLogs
+      };
+
+      setInv((prev) => ({
+        ...prev,
+        ...failedInv
       }));
-      updateInvestigation(inv.id, {
-        status: 'FAILED',
-        agents: failedAgents,
-        logs: failedLogs
-      });
+      updateInvestigation(inv.id, failedInv);
+      try {
+        api.syncInvestigation(inv.id, failedInv).catch(() => {});
+      } catch (e) {}
     }
-  }, [inv, updateInvestigation, addNotification]);
+  }, [id, inv, updateInvestigation, addNotification]);
 
   // Dedicated Retry Patch Synthesis invoking the real backend endpoint POST /api/ai/nemotron/patch
   const retryPatchSynthesis = useCallback(async () => {
@@ -834,11 +917,18 @@ export default function LiveInvestigation() {
       owner = owner || parts[0];
       repoName = repoName || parts[1];
     } else {
-      repoName = repoName || rawRepo || '2D2Mesh';
+      repoName = repoName || rawRepo || '';
     }
-    owner = owner || 'anshpatel2212';
     const branch = inv.branch || 'main';
     const issueNumber = Number(inv.issue_number || inv.issueNumber || 1);
+
+    if (!owner || !repoName) {
+      const msg = 'Repository binding is missing (owner/repo). Refusing to retry to avoid cross-repository contamination.';
+      setErrorStatus(409);
+      setInvestigationError(msg);
+      addNotification(msg, 'error');
+      return;
+    }
 
     const invRes = inv.rootCause ? {
       root_cause: inv.rootCause.explanation || inv.rootCause.summary || '',
@@ -881,22 +971,34 @@ export default function LiveInvestigation() {
           repo: repoName,
           branch,
           issue_number: issueNumber,
-          patch: patchRes.patch
+          patch: patchRes.patch,
+          binding: patchRes.binding || null
         });
       } catch (testErr) {
+        const isTransportTimeout = testErr?.isTimeout || testErr?.errorCode === 'REQUEST_TIMEOUT';
         sandboxRes = {
           success: false,
-          status: 'ERROR',
-          message: testErr.message || 'Sandbox test invocation failed',
+          status: isTransportTimeout ? 'TIMEOUT' : 'ERROR',
+          message: testErr?.message || 'Sandbox test invocation failed',
           exit_code: 1,
           stdout: '',
-          stderr: testErr.message || 'Execution error'
+          stderr: testErr?.message || 'Execution error',
+          transport_failure: true
         };
       }
 
       const isTestPassed = sandboxRes?.status === 'PASSED';
       const isPatchFailedInSandbox = sandboxRes?.status === 'PATCH_FAILED';
-      const finalStatus = isPatchFailedInSandbox ? 'FAILED' : 'COMPLETE';
+      const skippedTestStatuses = ['NO_TESTS_FOUND', 'TESTS_NOT_CONFIGURED', 'UNSUPPORTED_PROJECT'];
+      const isTestSkipped = skippedTestStatuses.includes(sandboxRes?.status);
+      const finalStatus = isPatchFailedInSandbox
+        ? 'FAILED'
+        : isTestPassed
+        ? 'COMPLETE'
+        : isTestSkipped
+        ? 'READY_FOR_REVIEW'
+        : 'FAILED';
+      const finalProgress = finalStatus === 'COMPLETE' ? 100 : (finalStatus === 'READY_FOR_REVIEW' ? 90 : (isPatchFailedInSandbox ? 75 : 80));
 
       const finalAgents = (inv.agents || []).map((a) => {
         if (a.step === 3) {
@@ -911,8 +1013,10 @@ export default function LiveInvestigation() {
         if (a.step === 4) {
           return {
             ...a,
-            status: isTestPassed ? 'COMPLETE' : 'FAILED',
-            summary: isTestPassed ? 'Tests passed' : (sandboxRes?.message || 'Sandbox tests finished')
+            status: isTestPassed ? 'COMPLETE' : (isTestSkipped ? 'SKIPPED' : 'FAILED'),
+            summary: isTestPassed
+              ? 'Tests passed'
+              : (sandboxRes?.message || `Sandbox status: ${sandboxRes?.status || 'unknown'}`)
           };
         }
         return a;
@@ -921,7 +1025,7 @@ export default function LiveInvestigation() {
       const updatedInv = {
         ...inv,
         status: finalStatus,
-        progress: finalStatus === 'COMPLETE' ? 100 : 75,
+        progress: finalProgress,
         agents: finalAgents,
         patch: {
           file: patchRes.files_changed?.[0] || 'src/handler.py',
@@ -930,7 +1034,8 @@ export default function LiveInvestigation() {
           lines_removed: patchRes.lines_removed || 0,
           diff: patchRes.patch,
           explanation: patchRes.explanation,
-          validation: patchRes.validation
+          validation: patchRes.validation,
+          binding: patchRes.binding || null
         },
         sandboxResult: sandboxRes
       };
@@ -938,8 +1043,14 @@ export default function LiveInvestigation() {
       setInv(updatedInv);
       updateInvestigation(inv.id, updatedInv);
       setIsInvestigating(false);
-      setActiveTab('PATCH');
-      addNotification('✓ Patch synthesis retry succeeded!');
+      setActiveTab('TESTS');
+      if (isTestPassed) {
+        addNotification('✓ Patch synthesis retry succeeded and sandbox tests passed!');
+      } else if (finalStatus === 'READY_FOR_REVIEW') {
+        addNotification(`Patch synthesized; no runnable tests (${sandboxRes?.status}). Awaiting human review.`, 'info');
+      } else {
+        addNotification(`✕ Patch synthesized but sandbox testing failed: ${sandboxRes?.message || sandboxRes?.status || 'failed'}`, 'error');
+      }
 
       try {
         const synced = await api.syncInvestigation(inv.id, updatedInv);
@@ -963,6 +1074,145 @@ export default function LiveInvestigation() {
       addNotification(msg, 'error');
     }
   }, [inv, runRealInvestigation, updateInvestigation, addNotification]);
+
+  const handleRerunSandboxWithOverrides = useCallback(async ({ working_directory, test_command }) => {
+    const patchDiff = inv?.patch?.diff || inv?.diff?.diff;
+    if (!patchDiff) {
+      addNotification('No code patch available to test. Synthesize a patch first.', 'warning');
+      return;
+    }
+
+    let owner = inv.owner;
+    let repoName = inv.repo_name;
+    const rawRepo = inv.repo || inv.repository || '';
+    if (rawRepo.includes('/')) {
+      const parts = rawRepo.split('/');
+      owner = owner || parts[0];
+      repoName = repoName || parts[1];
+    } else {
+      repoName = repoName || rawRepo || '';
+    }
+    const branch = inv.branch || 'main';
+    const issueNumber = Number(inv.issue_number || inv.issueNumber || 1);
+
+    if (!owner || !repoName) {
+      addNotification('Repository binding is missing (owner/repo). Refusing to run sandbox to avoid cross-repository contamination.', 'error');
+      return;
+    }
+
+    addNotification('Executing isolated Docker sandbox test with custom overrides...', 'info');
+
+    const nowStr = new Date().toLocaleTimeString();
+    const startMsg = `[MANUAL TEST OVERRIDE] POST /api/ai/sandbox/test (Workdir: ${working_directory || 'default'}, Command: ${test_command || 'default'})`;
+
+    setInv((prev) => ({
+      ...prev,
+      logs: [
+        ...(prev?.logs || []),
+        { time: nowStr, agent: 'SYS', message: startMsg },
+        { time: nowStr, agent: 'Testing', message: 'Mounting isolated workspace with custom parameters into Docker sandbox (--network none)...' }
+      ]
+    }));
+
+    try {
+      const sandboxRes = await api.runSandboxTest({
+        owner,
+        repo: repoName,
+        branch,
+        issue_number: issueNumber,
+        patch: patchDiff,
+        working_directory_override: working_directory || undefined,
+        test_command_override: test_command || undefined,
+        binding: inv?.patch?.binding || null
+      });
+
+      const isTestPassed = sandboxRes?.status === 'PASSED';
+      const rerunSkippedStatuses = ['TESTS_NOT_CONFIGURED', 'NO_TESTS_FOUND', 'UNSUPPORTED_PROJECT'];
+      const testingStatus = isTestPassed
+        ? 'COMPLETE'
+        : rerunSkippedStatuses.includes(sandboxRes?.status)
+        ? 'SKIPPED'
+        : 'FAILED';
+
+      const testingSummary = isTestPassed
+        ? `Tests passed: ${sandboxRes.tests_passed ?? 'All'}/${sandboxRes.tests_run ?? sandboxRes.tests_passed ?? 'All'} (${sandboxRes.duration_seconds || 1}s)`
+        : sandboxRes?.status === 'TESTS_NOT_CONFIGURED'
+        ? 'No test suite configured for this component'
+        : sandboxRes?.status === 'NO_TESTS_FOUND'
+        ? 'Test runner executed but found no matching tests'
+        : sandboxRes?.status === 'UNSUPPORTED_PROJECT'
+        ? 'Repository language or build system is not supported for isolated execution'
+        : sandboxRes?.status === 'TEST_COLLECTION_ERROR'
+        ? `Test collection error: ${(sandboxRes?.message || 'Test discovery failed').split('\n')[0]}`
+        : sandboxRes?.status === 'TIMEOUT'
+        ? `Test execution timed out: ${(sandboxRes?.message || 'Execution exceeded time limit').split('\n')[0]}`
+        : sandboxRes?.status === 'ENVIRONMENT_ERROR'
+        ? `Environment error: ${(sandboxRes?.message || 'Application import or conftest error').split('\n')[0]}`
+        : sandboxRes?.status === 'DEPENDENCIES_UNAVAILABLE'
+        ? `Dependencies unavailable: ${(sandboxRes?.message || 'Package installation failed').split('\n')[0]}`
+        : sandboxRes?.status === 'DOCKER_UNAVAILABLE'
+        ? 'Docker daemon unavailable'
+        : sandboxRes?.status === 'PATCH_FAILED'
+        ? `Patch failed in sandbox: ${sandboxRes?.message || 'Hunk mismatch'}`
+        : sandboxRes?.status === 'ERROR'
+        ? `Sandbox execution error: ${sandboxRes?.message || 'Execution failed'}`
+        : `Tests failed (exit code ${sandboxRes?.exit_code ?? 1})`;
+
+      const completionMsg = `Manual sandbox test run complete: ${sandboxRes?.status} (Command: ${sandboxRes?.test_command || 'None'}, Exit: ${sandboxRes?.exit_code ?? 'N/A'})`;
+
+      setInv((prev) => {
+        const updatedAgents = (prev?.agents || []).map((ag) => {
+          if (ag.id === '4' || ag.name === 'Testing Agent') {
+            return {
+              ...ag,
+              status: testingStatus,
+              time: sandboxRes?.duration_seconds ? `${sandboxRes.duration_seconds}s` : '1.2s',
+              summary: testingSummary
+            };
+          }
+          return ag;
+        });
+
+        const updated = {
+          ...prev,
+          sandboxResult: sandboxRes,
+          agents: updatedAgents,
+          testSummary: {
+            total: sandboxRes?.tests_run || 0,
+            passed: sandboxRes?.tests_passed || 0,
+            failed: sandboxRes?.tests_failed || 0,
+            pending: 0,
+            status: sandboxRes?.status || 'COMPLETED'
+          },
+          logs: [
+            ...(prev?.logs || []),
+            { time: new Date().toLocaleTimeString(), agent: 'Testing', message: completionMsg }
+          ]
+        };
+
+        updateInvestigation(inv.id, updated);
+        return updated;
+      });
+
+      if (isTestPassed) {
+        addNotification('✓ Custom Docker sandbox tests PASSED!', 'success');
+      } else {
+        addNotification(`Docker sandbox finished: ${sandboxRes?.status}`, 'info');
+      }
+
+      return sandboxRes;
+    } catch (err) {
+      console.error('[Manual Sandbox Run Error]', err);
+      addNotification(`Manual sandbox execution failed: ${err.message || 'Error'}`, 'error');
+      setInv((prev) => ({
+        ...prev,
+        logs: [
+          ...(prev?.logs || []),
+          { time: new Date().toLocaleTimeString(), agent: 'SYS', message: `[ERROR] Manual sandbox run error: ${err.message}` }
+        ]
+      }));
+    }
+  }, [inv, updateInvestigation, addNotification]);
 
   // Auto-trigger Real Investigation if not yet complete
   useEffect(() => {
@@ -1051,32 +1301,13 @@ export default function LiveInvestigation() {
     return () => clearInterval(interval);
   }, [isSimulating, inv, isRealMode, updateInvestigation, addNotification]);
 
-  if (!inv) {
-    return (
-      <div className="py-20 text-center space-y-4 max-w-md mx-auto">
-        <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mx-auto text-slate-500">
-          <AlertCircle className="w-6 h-6 text-amber-500" />
-        </div>
-        <h2 className="text-xl font-bold text-[#0F172A]">Investigation Not Found</h2>
-        <p className="text-sm text-[#64748B]">
-          No active or saved investigation dossier was found with ID #{id}. Please select a repository issue to investigate.
-        </p>
-        <div className="flex items-center justify-center gap-3 pt-2">
-          <Button to="/repositories" variant="primary">
-            Select an Issue to Investigate
-          </Button>
-          <Button to="/history" variant="outline">
-            View History
-          </Button>
-        </div>
-      </div>
-    );
-  }
-
-  const isComplete = inv.status === 'COMPLETE' || inv.status === 'READY_FOR_REVIEW' || inv.status === 'PR_READY' || (inv.progress || 0) >= 100;
-  const isStopped = inv.status === 'STOPPED';
+  const isFailed = inv?.status === 'FAILED' || inv?.status === 'ENVIRONMENT_ERROR' || Boolean(investigationError);
+  // Never let a raw progress counter (or a prior READY_FOR_REVIEW) mask a failure.
+  const isComplete = !isFailed && (inv?.status === 'COMPLETE' || inv?.status === 'READY_FOR_REVIEW' || inv?.status === 'PR_READY' || (inv?.progress || 0) >= 100);
+  const isStopped = inv?.status === 'STOPPED';
 
   const handleFastForward = () => {
+    if (!inv) return;
     if (isRealMode) {
       addNotification('Fast-forward is disabled in Real Mode. Showing actual backend state.', 'info');
       return;
@@ -1108,6 +1339,7 @@ export default function LiveInvestigation() {
   };
 
   const handleStopInvestigation = () => {
+    if (!inv) return;
     const stopped = {
       ...inv,
       status: 'STOPPED',
@@ -1125,6 +1357,7 @@ export default function LiveInvestigation() {
     executedTracker.current.clear();
     setInvestigationError(null);
     setPatchErrorDetails(null);
+    setFailureInfo(null);
     setErrorStatus(null);
 
     let activeRunId = null;
@@ -1167,6 +1400,28 @@ export default function LiveInvestigation() {
     runRealInvestigation(activeRunId);
   }, [inv, id, isInvestigating, isRealMode, runRealInvestigation]);
 
+  if (!inv) {
+    return (
+      <div className="py-20 text-center space-y-4 max-w-md mx-auto">
+        <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mx-auto text-slate-500">
+          <AlertCircle className="w-6 h-6 text-amber-500" />
+        </div>
+        <h2 className="text-xl font-bold text-[#0F172A]">Investigation Not Found</h2>
+        <p className="text-sm text-[#64748B]">
+          No active or saved investigation dossier was found with ID #{id}. Please select a repository issue to investigate.
+        </p>
+        <div className="flex items-center justify-center gap-3 pt-2">
+          <Button to="/repositories" variant="primary">
+            Select an Issue to Investigate
+          </Button>
+          <Button to="/history" variant="outline">
+            View History
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       {/* 1. Investigation Header */}
@@ -1174,6 +1429,7 @@ export default function LiveInvestigation() {
         inv={inv}
         isComplete={isComplete}
         isStopped={isStopped}
+        isFailed={isFailed}
         isRealMode={isRealMode}
         isInvestigating={isInvestigating}
         onFastForward={handleFastForward}
@@ -1265,6 +1521,31 @@ export default function LiveInvestigation() {
               <p className="mt-1 text-[#991B1B] text-xs">
                 {investigationError}
               </p>
+              {failureInfo && (
+                <div className="flex flex-wrap items-center gap-2 pt-2 text-[11px]">
+                  <span className="bg-white px-2 py-0.5 rounded border border-[#FCA5A5] text-[#7F1D1D]">
+                    Failed stage: <strong>{failureInfo.stage}</strong>
+                  </span>
+                  {failureInfo.runId && (
+                    <span className="bg-white px-2 py-0.5 rounded border border-[#FCA5A5] font-mono text-[#7F1D1D]">
+                      Run: {failureInfo.runId}
+                    </span>
+                  )}
+                  {failureInfo.elapsedSeconds !== undefined && (
+                    <span className="bg-white px-2 py-0.5 rounded border border-[#FCA5A5] text-[#7F1D1D]">
+                      Elapsed: {failureInfo.elapsedSeconds}s
+                    </span>
+                  )}
+                  {failureInfo.errorCode && (
+                    <span className="bg-white px-2 py-0.5 rounded border border-[#FCA5A5] font-mono text-[#7F1D1D]">
+                      {failureInfo.errorCode}
+                    </span>
+                  )}
+                  <span className={`px-2 py-0.5 rounded font-medium ${failureInfo.retryable ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-slate-100 text-slate-700'}`}>
+                    {failureInfo.retryable ? '✓ Retryable' : '✗ Not retryable'}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
 
@@ -1278,7 +1559,7 @@ export default function LiveInvestigation() {
               >
                 Reconnect GitHub
               </Button>
-            ) : (
+            ) : (!failureInfo || failureInfo.retryable) ? (
               <Button
                 variant="outline"
                 size="sm"
@@ -1288,16 +1569,17 @@ export default function LiveInvestigation() {
               >
                 Retry Investigation
               </Button>
-            )}
+            ) : null}
           </div>
         </div>
       )}
 
       {/* 2. Investigation Progress */}
       <InvestigationProgress
-        progress={inv.progress || 100}
+        progress={inv.progress || (isFailed ? 40 : 100)}
         isComplete={isComplete}
         isStopped={isStopped}
+        isFailed={isFailed}
       />
 
       {/* 3. Main Grid: Left Agents Panel (4 Cols) + Right Live Tabs (8 Cols) */}
@@ -1477,6 +1759,8 @@ export default function LiveInvestigation() {
               isRealMode={isRealMode}
               sandboxResult={inv.sandboxResult}
               isTestingRunning={isInvestigating && inv.progress >= 70 && !inv.sandboxResult}
+              onRerunSandbox={handleRerunSandboxWithOverrides}
+              hasPatch={Boolean(inv.patch?.diff || inv.diff?.diff)}
             />
           )}
 
