@@ -19,6 +19,7 @@ from app.services.github_service import (
 from app.schemas.github import (
     GitHubUserResponse,
     GitHubUser,
+    GitHubConnectPATRequest,
     GitHubRepositoryResponse,
     GitHubBranchResponse,
     GitHubIssueResponse,
@@ -301,6 +302,57 @@ def disconnect_github(request: Request, response: Response):
         session_store.delete_session(session_id)
     response.delete_cookie(settings.SESSION_COOKIE_NAME, path="/")
     return {"status": "disconnected", "message": "GitHub disconnected successfully."}
+
+@router.post("/connect-pat", response_model=GitHubUserResponse)
+async def connect_github_pat(
+    request: Request,
+    response: Response,
+    body: GitHubConnectPATRequest
+):
+    """
+    Connects to GitHub using a Personal Access Token (PAT) directly.
+    Allows testing with real GitHub account without needing to configure an OAuth App.
+    Also supports 'demo' token for instant mock access.
+    """
+    token = body.token.strip()
+    if not token:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"error": "invalid_token", "message": "Personal access token cannot be empty."})
+
+    if token.lower() in ("demo", "mock", "test"):
+        user_info = {
+            "id": 12345678,
+            "login": "devrescue-engineer",
+            "name": "DevRescue Engineer (Demo)",
+            "avatar_url": "https://avatars.githubusercontent.com/u/9919?v=4",
+            "html_url": "https://github.com/AP2203/DevRescue-AI-",
+            "email": "engineer@devrescue.ai"
+        }
+        token = "mock_github_token_for_demo"
+    else:
+        try:
+            user_info = await github_service.get_authenticated_user(token)
+        except Exception as exc:
+            logger.warning(f"[AUTH] Failed to validate PAT with GitHub: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"error": "invalid_github_token", "message": "Could not authenticate with GitHub using this token. Please check that the token is valid and has 'repo' scopes."}
+            )
+
+    session_id = session_store.create_session(token, user_info)
+    is_secure = settings.FRONTEND_URL.startswith("https://") or request.headers.get("x-forwarded-proto") == "https"
+    response.set_cookie(
+        key=settings.SESSION_COOKIE_NAME,
+        value=session_id,
+        httponly=True,
+        samesite="none" if is_secure else "lax",
+        secure=is_secure,
+        path="/",
+        max_age=86400 * 7
+    )
+    return GitHubUserResponse(
+        authenticated=True,
+        user=GitHubUser(**user_info)
+    )
 
 # -------------------------------------------------------------
 # 2. Repository & Resource Endpoints
