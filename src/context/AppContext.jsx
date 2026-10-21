@@ -116,6 +116,25 @@ export function AppProvider({ children }) {
     }
   }, [addNotification]);
 
+  const connectGithubPat = useCallback(async (token) => {
+    setGithubLoading(true);
+    try {
+      const res = await api.connectGithubPat(token);
+      if (res && res.authenticated && res.user) {
+        setGithubUser(res.user);
+        setGithubConnected(true);
+        addNotification(`✓ Connected as @${res.user.login}`, 'success');
+        return res.user;
+      }
+      throw new Error('Failed to authenticate with GitHub.');
+    } catch (err) {
+      addNotification(`Failed to connect GitHub: ${err.message}`, 'error');
+      throw err;
+    } finally {
+      setGithubLoading(false);
+    }
+  }, [addNotification]);
+
   // Check backend health & sync data on startup
   useEffect(() => {
     let isMounted = true;
@@ -433,6 +452,7 @@ export function AppProvider({ children }) {
         githubLoading,
         checkGithubStatus,
         disconnectGithub,
+        connectGithubPat,
         repositories,
         investigations,
         pullRequests,

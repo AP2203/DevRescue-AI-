@@ -49,10 +49,17 @@ export default function Repositories() {
     disconnectGithub,
     repositories: demoRepositories,
     connectRepository,
+    connectGithubPat,
     addNotification
   } = useApp();
 
   const [searchParams, setSearchParams] = useSearchParams();
+
+  // PAT Connection Modal State
+  const [patModalOpen, setPatModalOpen] = useState(false);
+  const [patToken, setPatToken] = useState('');
+  const [patLoading, setPatLoading] = useState(false);
+  const [patError, setPatError] = useState('');
 
   // URL query parameter handling (from GitHub OAuth redirect)
   useEffect(() => {
@@ -137,6 +144,37 @@ export default function Repositories() {
   // Connect GitHub trigger
   const handleConnectGithub = () => {
     api.githubLogin();
+  };
+
+  const handlePatSubmit = async (e) => {
+    e.preventDefault();
+    if (!patToken.trim()) return;
+    setPatLoading(true);
+    setPatError('');
+    try {
+      await connectGithubPat(patToken.trim());
+      setPatModalOpen(false);
+      setPatToken('');
+      fetchRealRepositories();
+    } catch (err) {
+      setPatError(err.message || 'Failed to authenticate with GitHub.');
+    } finally {
+      setPatLoading(false);
+    }
+  };
+
+  const handleInstantDemo = async () => {
+    setPatLoading(true);
+    setPatError('');
+    try {
+      await connectGithubPat('demo');
+      setPatModalOpen(false);
+      fetchRealRepositories();
+    } catch (err) {
+      setPatError(err.message || 'Failed to initialize demo session.');
+    } finally {
+      setPatLoading(false);
+    }
   };
 
   // Demo connect submit
@@ -312,15 +350,30 @@ export default function Repositories() {
               inspect open bug issues, clone target branches, and prepare verified pull requests.
             </p>
 
-            <div className="pt-2">
+            <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
               <PrimaryButton
                 onClick={handleConnectGithub}
                 loading={githubLoading}
                 icon={GithubIcon}
-                size="lg"
+                size="md"
               >
-                Connect with GitHub
+                Sign in with GitHub (OAuth)
               </PrimaryButton>
+              <Button
+                variant="outline"
+                size="md"
+                onClick={() => setPatModalOpen(true)}
+              >
+                Connect with Token (PAT)
+              </Button>
+              <Button
+                variant="ghost"
+                size="md"
+                onClick={handleInstantDemo}
+                loading={patLoading}
+              >
+                ⚡ Instant Demo Repos
+              </Button>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-6 text-xs text-[#64748B] text-left border-t border-[#E2E8F0]">
@@ -777,6 +830,79 @@ export default function Repositories() {
 
           <div className="p-3 bg-[#EFF6FF] border border-[#BFDBFE] rounded-lg text-xs text-[#2563EB]">
             Demo Mode: Repository will be added to your local prototype environment.
+          </div>
+        </form>
+      </Modal>
+
+      {/* Connect with Personal Access Token Modal */}
+      <Modal
+        isOpen={patModalOpen}
+        onClose={() => setPatModalOpen(false)}
+        title="Connect via GitHub Token"
+        footer={
+          <div className="flex items-center justify-between w-full">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleInstantDemo}
+              loading={patLoading}
+            >
+              ⚡ Use Demo Token
+            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setPatModalOpen(false)}
+                disabled={patLoading}
+              >
+                Cancel
+              </Button>
+              <PrimaryButton
+                size="sm"
+                onClick={handlePatSubmit}
+                loading={patLoading}
+                disabled={!patToken.trim()}
+              >
+                Connect Account
+              </PrimaryButton>
+            </div>
+          </div>
+        }
+      >
+        <form onSubmit={handlePatSubmit} className="space-y-4">
+          <p className="text-xs text-[#64748B] leading-relaxed">
+            Enter a GitHub Personal Access Token (classic with <code className="px-1 py-0.5 rounded bg-slate-100 font-mono text-[11px] text-[#0F172A]">repo</code> scope or fine-grained token). Your token is securely stored in a session on your local machine and never exposed.
+          </p>
+
+          <div>
+            <label className="block text-xs font-semibold text-[#0F172A] uppercase tracking-wider mb-1.5">
+              Personal Access Token
+            </label>
+            <input
+              type="password"
+              value={patToken}
+              onChange={(e) => setPatToken(e.target.value)}
+              placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              required
+              autoFocus
+              className="w-full rounded-lg bg-white border border-[#E2E8F0] px-3.5 py-2 font-mono text-sm text-[#0F172A] focus:outline-none focus:ring-2 focus:ring-[#2563EB]/20 focus:border-[#2563EB]"
+            />
+          </div>
+
+          {patError && (
+            <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-600 font-medium">
+              {patError}
+            </div>
+          )}
+
+          <div className="p-3 bg-[#F8FAFC] border border-[#E2E8F0] rounded-lg text-[11px] text-[#64748B] space-y-1">
+            <div className="font-semibold text-[#0F172A]">Need a token?</div>
+            <div>
+              1. Go to <a href="https://github.com/settings/tokens/new" target="_blank" rel="noopener noreferrer" className="text-[#2563EB] hover:underline font-medium">GitHub Token Generator ↗</a>
+            </div>
+            <div>2. Check the <b>repo</b> scope and click <b>Generate token</b>.</div>
+            <div>3. Or click <b>"Use Demo Token"</b> to test immediately without any token.</div>
           </div>
         </form>
       </Modal>

@@ -294,6 +294,13 @@ export async function disconnectGithub() {
   });
 }
 
+export async function connectGithubPat(token) {
+  return request('/api/github/connect-pat', {
+    method: 'POST',
+    body: JSON.stringify({ token })
+  });
+}
+
 export async function getGithubRepositories(page = 1, perPage = 30) {
   return request(`/api/github/repositories?page=${page}&per_page=${perPage}`);
 }
@@ -463,6 +470,7 @@ const api = {
   githubLogin,
   getGithubUser,
   disconnectGithub,
+  connectGithubPat,
   getGithubRepositories,
   getGithubRepository,
   getGithubBranches,

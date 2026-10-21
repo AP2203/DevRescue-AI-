@@ -13,6 +13,9 @@ class GitHubUserResponse(BaseModel):
     authenticated: bool
     user: Optional[GitHubUser] = None
 
+class GitHubConnectPATRequest(BaseModel):
+    token: str = Field(..., min_length=3, description="GitHub Personal Access Token (classic or fine-grained) or 'demo'")
+
 class GitHubRepositoryResponse(BaseModel):
     id: int
     name: str
