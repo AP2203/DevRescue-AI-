@@ -1,4 +1,5 @@
 import os
+import json
 import uuid
 import time
 import hashlib
@@ -14,7 +15,7 @@ from app.services.patch_feature_extractor import patch_feature_extractor
 from app.services.nebius_service import nebius_service
 from app.services.sandbox_service import sandbox_service
 from app.services.security_service import security_service
-from app.services.diff_validator import diff_validator
+from app.services.diff_validator import diff_validator, DiffValidationError
 from app.services.github_service import (
     github_service,
     validate_safe_repo_path,
@@ -28,6 +29,12 @@ from app.schemas.investigations import StageStatus
 from app.services.nemotron_service import _sanitize_error
 
 logger = logging.getLogger("devrescue.investigation")
+
+INVESTIGATIONS_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "data",
+    "investigations_state.json"
+)
 
 STAGE_DEFINITIONS = [
     (1, "repo_retrieval", "Repository & Issue Retrieval", "Repository Analyzer"),
@@ -63,8 +70,9 @@ def create_initial_stages() -> List[Dict[str, Any]]:
 
 
 class InvestigationService:
-    def __init__(self):
-        # In-memory storage for investigations and runs in FastAPI
+    def __init__(self, state_file: Optional[str] = None):
+        self.state_file = state_file or os.getenv("INVESTIGATIONS_STATE_FILE", INVESTIGATIONS_STATE_FILE)
+        # In-memory storage for investigations and runs in FastAPI (backed by disk persistence)
         self.investigations: Dict[str, Dict[str, Any]] = {}
         self.runs: Dict[str, Dict[str, Any]] = {}
         self.investigation_runs: Dict[str, List[str]] = {}
@@ -73,6 +81,58 @@ class InvestigationService:
         # Monotonic id allocator: guarantees unique investigation ids even after
         # deletions or as concurrent requests interleave (avoids cross-run collisions).
         self._inv_counter = 1
+        self._load_state()
+
+    def _load_state(self) -> None:
+        """Loads investigations, runs, and PR records from disk if present."""
+        if not os.path.isfile(self.state_file):
+            return
+        try:
+            with open(self.state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.investigations = data.get("investigations", {})
+            self.runs = data.get("runs", {})
+            self.investigation_runs = data.get("investigation_runs", {})
+            self.pull_requests = data.get("pull_requests", [])
+            max_id = 0
+            for k in self.investigations.keys():
+                if k.startswith("inv-"):
+                    suffix = k.split("-", 1)[1]
+                    if suffix.isdigit():
+                        max_id = max(max_id, int(suffix))
+            self._inv_counter = data.get("inv_counter", max_id + 1)
+            logger.info(f"[INVESTIGATION] Loaded {len(self.investigations)} investigations, {len(self.runs)} runs from {self.state_file}.")
+        except Exception as e:
+            logger.warning(f"[INVESTIGATION] Failed to load state from {self.state_file}: {e}")
+
+    def _save_state(self) -> None:
+        """Atomically persists investigations, runs, and PR records to disk."""
+        tmp_path = None
+        try:
+            parent = os.path.dirname(self.state_file)
+            if parent and not os.path.exists(parent):
+                os.makedirs(parent, exist_ok=True)
+            tmp_path = f"{self.state_file}.tmp.{os.getpid()}"
+            payload = {
+                "investigations": self.investigations,
+                "runs": self.runs,
+                "investigation_runs": self.investigation_runs,
+                "pull_requests": self.pull_requests,
+                "inv_counter": self._inv_counter,
+            }
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, default=str)
+            if os.path.exists(self.state_file):
+                os.replace(tmp_path, self.state_file)
+            else:
+                os.rename(tmp_path, self.state_file)
+        except Exception as e:
+            logger.warning(f"[INVESTIGATION] Failed to save state to {self.state_file}: {e}")
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
     def _allocate_investigation_id(self) -> str:
         """Allocates a monotonically increasing, collision-free investigation id."""
@@ -140,6 +200,7 @@ class InvestigationService:
 
         self.runs[run_id] = run
         self.investigation_runs.setdefault(inv_id, []).append(run_id)
+        self._save_state()
         return run
 
     def _map_stages_to_agents(self, run: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -278,6 +339,7 @@ class InvestigationService:
                 inv["stages"] = run["stages"]
                 inv["agents"] = self._map_stages_to_agents(run)
                 inv["updated_at"] = now_iso
+        self._save_state()
 
     def _log_run(
         self,
@@ -349,6 +411,7 @@ class InvestigationService:
             "logs": run["logs"]
         }
         self.investigations[inv_id] = inv
+        self._save_state()
         return inv
 
     async def start_run(
@@ -380,6 +443,7 @@ class InvestigationService:
         inv["agents"] = self._map_stages_to_agents(run)
         inv["sandboxResult"] = None
         inv["error_summary"] = None
+        self._save_state()
 
         # Launch staged runner in background
         asyncio.create_task(self.execute_staged_run(inv_id, run["run_id"], access_token=access_token, mode=mode))
@@ -1013,6 +1077,7 @@ class InvestigationService:
         }
 
         self.investigations[inv_id] = inv
+        self._save_state()
         return inv
 
     async def approve_run(
@@ -1255,6 +1320,7 @@ class InvestigationService:
             self._update_stage(run, "human_approval", StageStatus.FAILED.value, summary=f"Rejected: {reason or 'Declined by reviewer'}")
             self._log_run(run, "human_approval", "Maintainer Review", f"Investigation rejected: {reason or 'No reason provided.'}", level="WARNING")
 
+        self._save_state()
         return {
             "status": "rejected",
             "investigation_id": inv_id,

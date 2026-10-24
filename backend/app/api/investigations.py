@@ -162,6 +162,7 @@ async def sync_investigation(inv_id: str, payload: SyncInvestigationRequest):
         elif "risk_assessment" in raw_payload and raw_payload["risk_assessment"]:
             run["risk_assessment"] = raw_payload["risk_assessment"]
 
+    investigation_service._save_state()
     return inv
 
 
