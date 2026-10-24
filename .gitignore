@@ -2,6 +2,8 @@
 node_modules/
 dist/
 dist-ssr/
+scratch_2d2mesh/
+DevRescue-AI-/
 
 # Environment Variables
 .env

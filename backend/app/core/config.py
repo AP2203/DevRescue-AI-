@@ -39,6 +39,10 @@ class Settings(BaseModel):
     VERSION: str = "1.0.0"
     API_V1_PREFIX: str = "/api"
     
+    # Server Bind
+    HOST: str = os.getenv("HOST", "0.0.0.0")
+    PORT: int = int(os.getenv("PORT", "8000"))
+
     # Frontend URL & CORS
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:5173")
     ALLOWED_ORIGINS: List[str] = _get_default_origins()
