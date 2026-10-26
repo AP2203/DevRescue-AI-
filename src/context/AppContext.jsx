@@ -14,16 +14,10 @@ const STORAGE_KEYS = {
 };
 
 export function AppProvider({ children }) {
-  // Mode: 'REAL' (uses FastAPI + XGBoost + Real GitHub) vs 'DEMO' (uses local mock data)
-  const initialAppMode = (() => {
-    try {
-      return localStorage.getItem(STORAGE_KEYS.APP_MODE) || 'REAL';
-    } catch {
-      return 'REAL';
-    }
-  })();
+  // Mode: Strictly REAL by default (uses FastAPI + XGBoost + Real GitHub API)
+  const initialAppMode = 'REAL';
 
-  const [appMode, setAppModeState] = useState(initialAppMode);
+  const [appMode, setAppModeState] = useState('REAL');
 
   const [backendHealth, setBackendHealth] = useState({
     status: 'checking',
@@ -36,19 +30,10 @@ export function AppProvider({ children }) {
   const [githubConnected, setGithubConnected] = useState(false);
   const [githubLoading, setGithubLoading] = useState(false);
 
-  const [repositories, setRepositories] = useState(MOCK_REPOSITORIES);
-  const [investigations, setInvestigations] = useState(MOCK_INVESTIGATIONS);
-  const [pullRequests, setPullRequests] = useState(() => {
-    if (initialAppMode === 'REAL') {
-      return [];
-    }
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.PRS);
-      return saved ? JSON.parse(saved) : MOCK_PULL_REQUESTS;
-    } catch {
-      return MOCK_PULL_REQUESTS;
-    }
-  });
+  // In REAL mode, collections are empty until connected to real GitHub / backend
+  const [repositories, setRepositories] = useState([]);
+  const [investigations, setInvestigations] = useState([]);
+  const [pullRequests, setPullRequests] = useState([]);
   const [notifications, setNotifications] = useState([]);
 
   const setAppMode = (mode) => {
@@ -93,6 +78,14 @@ export function AppProvider({ children }) {
       if (res && res.authenticated && res.user) {
         setGithubUser(res.user);
         setGithubConnected(true);
+        try {
+          const repos = await api.getGithubRepositories();
+          if (Array.isArray(repos)) {
+            setRepositories(repos);
+          }
+        } catch (e) {
+          console.warn('[DevRescue] Could not load GitHub repos:', e);
+        }
       } else {
         setGithubUser(null);
         setGithubConnected(false);
@@ -110,6 +103,7 @@ export function AppProvider({ children }) {
       await api.disconnectGithub();
       setGithubUser(null);
       setGithubConnected(false);
+      setRepositories([]);
       addNotification('✓ GitHub disconnected');
     } catch (err) {
       addNotification(`Failed to disconnect GitHub: ${err.message}`, 'error');
@@ -124,6 +118,14 @@ export function AppProvider({ children }) {
         setGithubUser(res.user);
         setGithubConnected(true);
         addNotification(`✓ Connected as @${res.user.login}`, 'success');
+        try {
+          const repos = await api.getGithubRepositories();
+          if (Array.isArray(repos)) {
+            setRepositories(repos);
+          }
+        } catch (e) {
+          console.warn('[DevRescue] Could not load repos after PAT connect:', e);
+        }
         return res.user;
       }
       throw new Error('Failed to authenticate with GitHub.');

@@ -26,7 +26,16 @@ import Button from '../components/common/Button';
 
 export default function AppLayout() {
   const { user, logout } = useAuth();
-  const { investigations, notifications, removeNotification, appMode, setAppMode, backendHealth } = useApp();
+  const {
+    investigations,
+    notifications,
+    removeNotification,
+    appMode,
+    setAppMode,
+    backendHealth,
+    githubUser,
+    githubConnected
+  } = useApp();
   const location = useLocation();
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -89,7 +98,9 @@ export default function AppLayout() {
         </Link>
 
         <div className="flex items-center gap-2">
-          <Badge variant="demo" size="sm">DEMO</Badge>
+          <Badge variant={appMode === 'REAL' ? 'success' : 'demo'} size="sm">
+            {appMode === 'REAL' ? 'REAL' : 'DEMO'}
+          </Badge>
           <button
             type="button"
             onClick={() => setSidebarOpen(!sidebarOpen)}
@@ -256,13 +267,21 @@ export default function AppLayout() {
           {/* User Profile Info & Logout */}
           <div className="flex items-center justify-between px-1">
             <div className="flex items-center gap-2.5 min-w-0">
-              <Avatar name={user?.name || 'Ansh'} size="sm" />
+              {githubUser?.avatar_url ? (
+                <img
+                  src={githubUser.avatar_url}
+                  alt={githubUser.login}
+                  className="w-7 h-7 rounded-full border border-slate-200 object-cover flex-shrink-0"
+                />
+              ) : (
+                <Avatar name={githubUser?.name || githubUser?.login || user?.name || 'Engineer'} size="sm" />
+              )}
               <div className="min-w-0 flex-1">
                 <div className="text-xs font-semibold text-[#0F172A] truncate">
-                  {user?.name || 'Ansh'}
+                  {githubUser?.name || githubUser?.login || user?.name || 'Engineer'}
                 </div>
                 <div className="text-[11px] text-[#64748B] truncate">
-                  {user?.email || 'ansh@devrescue.ai'}
+                  {githubUser?.login ? `@${githubUser.login}` : (user?.email || (githubConnected ? 'GitHub Connected' : 'Guest Session'))}
                 </div>
               </div>
             </div>

@@ -244,41 +244,40 @@ export default function Repositories() {
         </div>
 
         <div className="flex items-center gap-2.5">
-          {appMode === 'REAL' ? (
-            githubConnected ? (
-              <>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={fetchRealRepositories}
-                  loading={loadingRealRepos}
-                  icon={RefreshCw}
-                >
-                  Refresh
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={disconnectGithub}
-                  icon={LogOut}
-                  className="text-red-600 hover:text-red-700 hover:bg-red-50 border-red-200"
-                >
-                  Disconnect
-                </Button>
-              </>
-            ) : (
+          {githubConnected ? (
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={fetchRealRepositories}
+                loading={loadingRealRepos}
+                icon={RefreshCw}
+              >
+                Refresh
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={disconnectGithub}
+                icon={LogOut}
+                className="text-red-600 hover:text-red-700 hover:bg-red-50 border-red-200"
+              >
+                Disconnect
+              </Button>
+            </>
+          ) : (
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setPatModalOpen(true)}
+              >
+                Enter PAT Token
+              </Button>
               <PrimaryButton onClick={handleConnectGithub} icon={GithubIcon} size="sm">
                 Connect GitHub
               </PrimaryButton>
-            )
-          ) : (
-            <PrimaryButton
-              onClick={() => setConnectModalOpen(true)}
-              icon={Plus}
-              size="sm"
-            >
-              Add Demo Repo
-            </PrimaryButton>
+            </div>
           )}
         </div>
       </div>
@@ -365,14 +364,6 @@ export default function Repositories() {
                 onClick={() => setPatModalOpen(true)}
               >
                 Connect with Token (PAT)
-              </Button>
-              <Button
-                variant="ghost"
-                size="md"
-                onClick={handleInstantDemo}
-                loading={patLoading}
-              >
-                ⚡ Instant Demo Repos
               </Button>
             </div>
 
@@ -840,33 +831,23 @@ export default function Repositories() {
         onClose={() => setPatModalOpen(false)}
         title="Connect via GitHub Token"
         footer={
-          <div className="flex items-center justify-between w-full">
+          <div className="flex items-center justify-end gap-2 w-full">
             <Button
-              variant="ghost"
+              variant="outline"
               size="sm"
-              onClick={handleInstantDemo}
-              loading={patLoading}
+              onClick={() => setPatModalOpen(false)}
+              disabled={patLoading}
             >
-              ⚡ Use Demo Token
+              Cancel
             </Button>
-            <div className="flex items-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setPatModalOpen(false)}
-                disabled={patLoading}
-              >
-                Cancel
-              </Button>
-              <PrimaryButton
-                size="sm"
-                onClick={handlePatSubmit}
-                loading={patLoading}
-                disabled={!patToken.trim()}
-              >
-                Connect Account
-              </PrimaryButton>
-            </div>
+            <PrimaryButton
+              size="sm"
+              onClick={handlePatSubmit}
+              loading={patLoading}
+              disabled={!patToken.trim()}
+            >
+              Connect Account
+            </PrimaryButton>
           </div>
         }
       >
@@ -899,10 +880,10 @@ export default function Repositories() {
           <div className="p-3 bg-[#F8FAFC] border border-[#E2E8F0] rounded-lg text-[11px] text-[#64748B] space-y-1">
             <div className="font-semibold text-[#0F172A]">Need a token?</div>
             <div>
-              1. Go to <a href="https://github.com/settings/tokens/new" target="_blank" rel="noopener noreferrer" className="text-[#2563EB] hover:underline font-medium">GitHub Token Generator ↗</a>
+              1. Open <a href="https://github.com/settings/tokens/new" target="_blank" rel="noopener noreferrer" className="text-[#2563EB] hover:underline font-medium">GitHub Token Settings ↗</a>
             </div>
-            <div>2. Check the <b>repo</b> scope and click <b>Generate token</b>.</div>
-            <div>3. Or click <b>"Use Demo Token"</b> to test immediately without any token.</div>
+            <div>2. Select the <code className="px-1 py-0.2 rounded bg-slate-100 font-mono">repo</code> scope and click <b>Generate token</b>.</div>
+            <div>3. Paste your token above to immediately access your repositories.</div>
           </div>
         </form>
       </Modal>
