@@ -1,3 +1,4 @@
+import os
 import sys
 import json
 import fastapi
@@ -25,9 +26,10 @@ def main():
     print(f"HTTPX version: {httpx.__version__}")
 
     print("\n=== STEP 2: ML MODEL VERIFICATION ===")
-    model_path = r"backend/app/ml/devrescue_risk_model.pkl"
-    features_path = r"backend/app/ml/devrescue_features.json"
-    labels_path = r"backend/app/ml/risk_label_mapping.json"
+    base_ml_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app", "ml")
+    model_path = os.path.join(base_ml_dir, "devrescue_risk_model.pkl")
+    features_path = os.path.join(base_ml_dir, "devrescue_features.json")
+    labels_path = os.path.join(base_ml_dir, "risk_label_mapping.json")
 
     # Load model
     model = joblib.load(model_path)
