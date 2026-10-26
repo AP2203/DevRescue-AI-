@@ -198,7 +198,7 @@ def github_login(request: Request, redirect: bool = True):
     return RedirectResponse(url=auth_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
 @router.get("/callback")
-async def github_callback(code: Optional[str] = None, state: Optional[str] = None):
+async def github_callback(request: Request, code: Optional[str] = None, state: Optional[str] = None):
     """
     Handles OAuth redirect from GitHub.
     Exchanges code for access token, establishes authenticated session, and redirects to frontend.

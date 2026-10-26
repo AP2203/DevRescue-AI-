@@ -665,7 +665,7 @@ class InvestigationService:
             MAX_REPAIRS = 2
             current_patch_text = patch_text
             retry_history = []
-            while test_res.status not in ("PASSED", "TESTS_NOT_CONFIGURED", "NO_TESTS_FOUND", "UNSUPPORTED_PROJECT") and repair_retries < MAX_REPAIRS:
+            while test_res.status not in ("PASSED", "TESTS_NOT_CONFIGURED", "NO_TESTS_FOUND", "UNSUPPORTED_PROJECT", "DOCKER_UNAVAILABLE") and repair_retries < MAX_REPAIRS:
                 repair_retries += 1
                 retry_entry = {
                     "attempt": repair_retries,
@@ -763,6 +763,9 @@ class InvestigationService:
             elif test_res.status == "DEPENDENCIES_UNAVAILABLE":
                 self._update_stage(run, "test_execution", StageStatus.FAILED.value, summary=f"Dependencies unavailable: {test_res.message.splitlines()[0] if test_res.message else 'Missing dependencies'}", details=test_dict)
                 self._log_run(run, "test_execution", "Testing Agent", f"Dependencies unavailable: {test_res.message}", level="ERROR")
+            elif test_res.status == "DOCKER_UNAVAILABLE":
+                self._update_stage(run, "test_execution", StageStatus.FAILED.value, summary=f"Docker daemon unavailable: {test_res.message.splitlines()[0] if test_res.message else 'Docker daemon not running'}", details=test_dict)
+                self._log_run(run, "test_execution", "Testing Agent", "Docker daemon unreachable. Please start Docker Desktop to enable sandboxed container test runs.", level="WARNING")
             else:
                 self._update_stage(run, "test_execution", StageStatus.FAILED.value, summary=f"Tests failed with exit code {test_res.exit_code}", details=test_dict)
                 self._log_run(run, "test_execution", "Testing Agent", f"Tests failed with exit code {test_res.exit_code}.", level="ERROR")

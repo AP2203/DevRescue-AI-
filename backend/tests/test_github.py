@@ -83,7 +83,7 @@ async def test_github_service_issue_filtering():
 
     with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
         mock_get.return_value = mock_resp
-        issues = await service.list_issues("dummy_token", "org", "repo")
+        issues = await service.list_issues("ghp_mocktoken1234567890abcdef", "org", "repo")
         assert len(issues) == 1
         assert issues[0]["number"] == 10
         assert issues[0]["title"] == "Real Bug in Auth Flow"
@@ -116,7 +116,7 @@ async def test_github_service_repo_normalization():
 
     with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
         mock_get.return_value = mock_resp
-        repos = await service.list_repositories("dummy_token")
+        repos = await service.list_repositories("ghp_mocktoken1234567890abcdef")
         assert len(repos) == 1
         r = repos[0]
         assert r["name"] == "core-engine"
