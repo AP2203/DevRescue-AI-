@@ -132,3 +132,4 @@ class DynamicPricingService:
         }
 
 pricing_service = DynamicPricingService()
+

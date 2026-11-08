@@ -130,3 +130,4 @@ def list_bounty_transactions(limit: int = Query(50, ge=1, le=100)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to query bounty transactions: {str(e)}"
         )
+

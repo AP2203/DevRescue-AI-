@@ -43,3 +43,4 @@ services:
         sync: false
       - key: GITHUB_REDIRECT_URI
         value: https://devrescue-ai-backend.onrender.com/api/github/callback
+

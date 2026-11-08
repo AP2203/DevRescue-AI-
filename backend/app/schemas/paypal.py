@@ -63,3 +63,4 @@ class PayPalTransaction(BaseModel):
     payer_name: Optional[str] = None
     created_at: float
     updated_at: float
+
