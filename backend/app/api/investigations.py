@@ -31,6 +31,9 @@ class CreateInvestigationRequest(BaseModel):
     # Direct/pipeline error fields
     error_description: Optional[str] = Field("", description="Detailed runtime error or description")
     mode: Optional[str] = Field("real", description="'real' or 'demo' mode")
+    paypal_order_id: Optional[str] = Field(None, description="Linked PayPal Bounty Order ID")
+    paypal_bounty: Optional[Dict[str, Any]] = Field(None, description="Bounty details & quoted amount")
+
 
 
 class SyncInvestigationRequest(BaseModel):
@@ -86,6 +89,10 @@ async def create_investigation(payload: CreateInvestigationRequest, request: Req
                 issue_title=target_issue_title,
                 issue_url=payload.issue_url
             )
+            if payload.paypal_order_id:
+                inv["paypal_order_id"] = payload.paypal_order_id
+            if payload.paypal_bounty:
+                inv["paypal_bounty"] = payload.paypal_bounty
             return inv
 
         # Direct pipeline creation
@@ -97,6 +104,10 @@ async def create_investigation(payload: CreateInvestigationRequest, request: Req
             issue_number=target_issue_num,
             mode=payload.mode or "real"
         )
+        if payload.paypal_order_id:
+            inv["paypal_order_id"] = payload.paypal_order_id
+        if payload.paypal_bounty:
+            inv["paypal_bounty"] = payload.paypal_bounty
         return inv
     except Exception as e:
         raise HTTPException(

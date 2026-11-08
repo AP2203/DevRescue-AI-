@@ -12,6 +12,7 @@ import {
 import GithubIcon from '../../components/common/GithubIcon';
 import { useApp } from '../../context/AppContext';
 import Button, { PrimaryButton } from '../../components/common/Button';
+import PayPalBountyCard from '../../components/common/PayPalBountyCard';
 import api from '../../services/api';
 
 export default function NewInvestigation() {
@@ -57,6 +58,7 @@ export default function NewInvestigation() {
   // Execution options
   const [testingEnabled, setTestingEnabled] = useState(true);
   const [securityEnabled, setSecurityEnabled] = useState(true);
+  const [paypalBountyOrder, setPaypalBountyOrder] = useState(null);
   const [loading, setLoading] = useState(false);
 
   // Fetch real repositories in REAL mode
@@ -202,7 +204,9 @@ export default function NewInvestigation() {
         issue_url: selectedIssueUrl || `https://github.com/${owner}/${repoName}/issues/${selectedIssueNumber || 42}`,
         error_description: issueDescription || '',
         errorDescription: issueDescription || '',
-        mode: appMode === 'REAL' ? 'real' : 'demo'
+        mode: appMode === 'REAL' ? 'real' : 'demo',
+        paypal_order_id: paypalBountyOrder?.order_id || null,
+        paypal_bounty: paypalBountyOrder || null
       });
 
       setLoading(false);
@@ -626,6 +630,19 @@ export default function NewInvestigation() {
             </div>
           </div>
 
+          {/* PayPal Bug Bounty Card */}
+          <PayPalBountyCard
+            repository={selectedRepo}
+            issueNumber={selectedIssueNumber}
+            issueTitle={issueTitle}
+            errorDescription={issueDescription}
+            onBountyFunded={(order) => {
+              setPaypalBountyOrder(order);
+              addNotification(`PayPal Sandbox Bounty Authorized: ${order.order_id} ($${order.amount})`, 'success');
+            }}
+            fundedOrder={paypalBountyOrder}
+          />
+
           <div className="flex items-center justify-between pt-4 border-t border-[#E2E8F0]">
             <Button variant="outline" size="md" onClick={() => setCurrentStep(1)}>
               Back
@@ -740,6 +757,19 @@ export default function NewInvestigation() {
             </div>
           </div>
 
+          {/* PayPal Bug Bounty Card */}
+          <PayPalBountyCard
+            repository={selectedRepo}
+            issueNumber={selectedIssueNumber}
+            issueTitle={issueTitle}
+            errorDescription={issueDescription}
+            onBountyFunded={(order) => {
+              setPaypalBountyOrder(order);
+              addNotification(`PayPal Sandbox Bounty Authorized: ${order.order_id} ($${order.amount})`, 'success');
+            }}
+            fundedOrder={paypalBountyOrder}
+          />
+
           <div className="flex items-center justify-between pt-4 border-t border-[#E2E8F0]">
             <Button variant="outline" size="md" onClick={() => setCurrentStep(2)}>
               Back
@@ -805,6 +835,22 @@ export default function NewInvestigation() {
                 {securityEnabled ? 'Enabled' : 'Disabled'}
               </span>
             </div>
+
+            {paypalBountyOrder && (
+              <div className="flex items-center justify-between py-2 border-t border-[#E2E8F0]">
+                <span className="text-xs text-blue-600 font-semibold flex items-center gap-1">
+                  <span>PayPal Bounty Escrow:</span>
+                </span>
+                <div className="text-right">
+                  <span className="text-sm font-bold text-emerald-600 font-mono">
+                    ${paypalBountyOrder.amount} {paypalBountyOrder.currency}
+                  </span>
+                  <span className="ml-2 text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-100 text-emerald-700">
+                    VERIFICATION-GATED
+                  </span>
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="p-4 bg-[#EFF6FF] border border-[#BFDBFE] rounded-xl flex items-center gap-3 text-xs text-[#2563EB]">

@@ -67,6 +67,13 @@ class Settings(BaseModel):
     NEMOTRON_CONNECT_TIMEOUT: float = float(os.getenv("NEMOTRON_CONNECT_TIMEOUT", "15.0"))
     NEMOTRON_MAX_RETRIES: int = int(os.getenv("NEMOTRON_MAX_RETRIES", "2"))
 
+    # PayPal Developer Platform (Sandbox & Orders API v2)
+    PAYPAL_CLIENT_ID: Optional[str] = os.getenv("PAYPAL_CLIENT_ID")
+    PAYPAL_CLIENT_SECRET: Optional[str] = os.getenv("PAYPAL_CLIENT_SECRET")
+    PAYPAL_MODE: str = os.getenv("PAYPAL_MODE", "sandbox")
+    PAYPAL_API_BASE: str = os.getenv("PAYPAL_API_BASE", "https://api-m.sandbox.paypal.com")
+    PAYPAL_WEBHOOK_ID: Optional[str] = os.getenv("PAYPAL_WEBHOOK_ID")
+
     # ML Model directory
     ML_DIR: str = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ml")
     MODEL_PATH: str = os.path.join(ML_DIR, "devrescue_risk_model.pkl")

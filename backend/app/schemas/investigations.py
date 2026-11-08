@@ -55,6 +55,8 @@ class InvestigationRun(BaseModel):
     risk_assessment: Optional[Dict[str, Any]] = Field(None, description="XGBoost risk prediction results")
     approval: Optional[Dict[str, Any]] = Field(None, description="Human review approval record")
     pull_request: Optional[Dict[str, Any]] = Field(None, description="Dispatched GitHub PR details")
+    paypal_order_id: Optional[str] = Field(None, description="Linked PayPal Bounty Order ID")
+    paypal_bounty: Optional[Dict[str, Any]] = Field(None, description="PayPal Bounty quote & escrow status")
     logs: List[InvestigationLogEntry] = Field(default_factory=list, description="Structured run execution logs")
     error_summary: Optional[str] = Field(None, description="Error summary if run failed")
 

@@ -446,6 +446,39 @@ export async function updateQueueConfig(config) {
   });
 }
 
+// ==========================================
+// PayPal Developer Platform & Bounties
+// ==========================================
+
+export async function getPayPalConfig() {
+  return request('/api/paypal/config');
+}
+
+export async function quotePayPalBounty(quotePayload) {
+  return request('/api/paypal/quote', {
+    method: 'POST',
+    body: JSON.stringify(quotePayload)
+  });
+}
+
+export async function createPayPalOrder(orderPayload) {
+  return request('/api/paypal/orders/create', {
+    method: 'POST',
+    body: JSON.stringify(orderPayload)
+  });
+}
+
+export async function capturePayPalOrder(orderId, investigationId = null) {
+  return request(`/api/paypal/orders/${orderId}/capture`, {
+    method: 'POST',
+    body: JSON.stringify({ order_id: orderId, investigation_id: investigationId })
+  });
+}
+
+export async function getPayPalTransactions(limit = 50) {
+  return request(`/api/paypal/transactions?limit=${limit}`);
+}
+
 const api = {
   healthCheck,
   getRiskHealth,
@@ -495,7 +528,12 @@ const api = {
   startQueueProcessing,
   pauseQueueProcessing,
   getQueueStats,
-  updateQueueConfig
+  updateQueueConfig,
+  getPayPalConfig,
+  quotePayPalBounty,
+  createPayPalOrder,
+  capturePayPalOrder,
+  getPayPalTransactions
 };
 
 export { api };

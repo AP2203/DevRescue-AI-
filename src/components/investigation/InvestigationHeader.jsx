@@ -54,6 +54,17 @@ export default function InvestigationHeader({
               SIMULATED DEMO RESULT
             </Badge>
           )}
+          {(inv?.paypal_order_id || inv?.paypal_bounty) && (
+            <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded border bg-[#EFF6FF] text-[#2563EB] border-[#BFDBFE] flex items-center gap-1">
+              <span>PayPal Bounty:</span>
+              <span className="text-emerald-600 font-bold">
+                ${inv?.paypal_bounty?.amount || 25} {inv?.paypal_bounty?.currency || 'USD'}
+              </span>
+              <span className="text-[9px] uppercase tracking-wider text-blue-500 font-semibold">
+                {isComplete ? '· CAPTURED' : '· ESCROW HELD'}
+              </span>
+            </span>
+          )}
         </div>
 
         <h1 className="text-xl sm:text-2xl font-extrabold tracking-tight text-[#0F172A] truncate">

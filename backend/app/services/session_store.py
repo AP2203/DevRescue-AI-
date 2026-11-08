@@ -6,7 +6,7 @@ import secrets
 import hashlib
 import hmac
 import base64
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from app.core.config import settings
 
 class GitHubSessionStore:
@@ -51,6 +51,22 @@ class GitHubSessionStore:
                     state TEXT PRIMARY KEY,
                     created_at REAL NOT NULL,
                     expires_at REAL NOT NULL
+                );
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS paypal_transactions (
+                    order_id TEXT PRIMARY KEY,
+                    capture_id TEXT,
+                    investigation_id TEXT,
+                    repository TEXT,
+                    issue_number INTEGER,
+                    amount REAL NOT NULL,
+                    currency TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payer_email TEXT,
+                    payer_name TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
                 );
             """)
             conn.commit()
@@ -220,6 +236,84 @@ class GitHubSessionStore:
             conn.execute("DELETE FROM github_sessions WHERE expires_at < ?", (now,))
             conn.execute("DELETE FROM oauth_states WHERE expires_at < ?", (now,))
             conn.commit()
+
+    # --- PayPal Bounty Transaction Persistence ---
+
+    def save_paypal_transaction(
+        self,
+        order_id: str,
+        amount: float,
+        currency: str = "USD",
+        status: str = "CREATED",
+        investigation_id: Optional[str] = None,
+        repository: Optional[str] = None,
+        issue_number: Optional[int] = None,
+        payer_email: Optional[str] = None,
+        payer_name: Optional[str] = None,
+        capture_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        now = time.time()
+        with self._get_connection() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO paypal_transactions
+                (order_id, capture_id, investigation_id, repository, issue_number, amount, currency, status, payer_email, payer_name, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (order_id, capture_id, investigation_id, repository, issue_number, amount, currency, status, payer_email, payer_name, now, now))
+            conn.commit()
+        return {
+            "order_id": order_id,
+            "capture_id": capture_id,
+            "investigation_id": investigation_id,
+            "repository": repository,
+            "issue_number": issue_number,
+            "amount": amount,
+            "currency": currency,
+            "status": status,
+            "payer_email": payer_email,
+            "payer_name": payer_name,
+            "created_at": now,
+            "updated_at": now
+        }
+
+    def update_paypal_transaction_status(
+        self,
+        order_id: str,
+        status: str,
+        capture_id: Optional[str] = None,
+        payer_email: Optional[str] = None,
+        payer_name: Optional[str] = None
+    ) -> bool:
+        now = time.time()
+        with self._get_connection() as conn:
+            updates = ["status = ?", "updated_at = ?"]
+            params = [status, now]
+            if capture_id:
+                updates.append("capture_id = ?")
+                params.append(capture_id)
+            if payer_email:
+                updates.append("payer_email = ?")
+                params.append(payer_email)
+            if payer_name:
+                updates.append("payer_name = ?")
+                params.append(payer_name)
+            params.append(order_id)
+            query = f"UPDATE paypal_transactions SET {', '.join(updates)} WHERE order_id = ?"
+            cur = conn.execute(query, tuple(params))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def get_paypal_transaction(self, order_id: str) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cur = conn.execute("SELECT * FROM paypal_transactions WHERE order_id = ?", (order_id,))
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+        return None
+
+    def list_paypal_transactions(self, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cur = conn.execute("SELECT * FROM paypal_transactions ORDER BY created_at DESC LIMIT ?", (limit,))
+            return [dict(row) for row in cur.fetchall()]
 
 session_store = GitHubSessionStore()
 

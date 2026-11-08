@@ -1306,6 +1306,21 @@ export default function LiveInvestigation() {
   const isComplete = !isFailed && (inv?.status === 'COMPLETE' || inv?.status === 'READY_FOR_REVIEW' || inv?.status === 'PR_READY' || (inv?.progress || 0) >= 100);
   const isStopped = inv?.status === 'STOPPED';
 
+  // Automatically capture authorized PayPal Sandbox Bounty upon 100% green verification
+  const paypalCapturedRef = useRef(false);
+  useEffect(() => {
+    if (isComplete && inv?.paypal_order_id && !paypalCapturedRef.current) {
+      paypalCapturedRef.current = true;
+      api.capturePayPalOrder(inv.paypal_order_id, inv.id)
+        .then((res) => {
+          addNotification(`PayPal Sandbox Bounty Captured: ${res.order_id} ($${res.amount || 25}) upon 100% green test suite verification!`, 'success');
+        })
+        .catch((err) => {
+          console.warn("PayPal capture notice:", err);
+        });
+    }
+  }, [isComplete, inv?.paypal_order_id, inv?.id, addNotification]);
+
   const handleFastForward = () => {
     if (!inv) return;
     if (isRealMode) {

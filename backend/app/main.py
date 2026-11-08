@@ -23,6 +23,7 @@ from app.api.github import router as github_router
 from app.api.nemotron import router as nemotron_router
 from app.api.sandbox import router as sandbox_router
 from app.api.repair_queue import router as repair_queue_router
+from app.api.paypal import router as paypal_router
 from app.services.risk_prediction_service import risk_service
 
 @asynccontextmanager
@@ -137,6 +138,7 @@ app.include_router(github_router, prefix=settings.API_V1_PREFIX)
 app.include_router(nemotron_router, prefix=settings.API_V1_PREFIX)
 app.include_router(sandbox_router, prefix=settings.API_V1_PREFIX)
 app.include_router(repair_queue_router, prefix=settings.API_V1_PREFIX)
+app.include_router(paypal_router, prefix=settings.API_V1_PREFIX)
 
 @app.get("/")
 def root():
@@ -158,7 +160,11 @@ def root():
             "nemotron_generate_patch": f"{settings.API_V1_PREFIX}/ai/nemotron/generate-patch",
             "nemotron_patch": f"{settings.API_V1_PREFIX}/ai/nemotron/patch",
             "sandbox_status": f"{settings.API_V1_PREFIX}/ai/sandbox/status",
-            "sandbox_test": f"{settings.API_V1_PREFIX}/ai/sandbox/test"
+            "sandbox_test": f"{settings.API_V1_PREFIX}/ai/sandbox/test",
+            "paypal_config": f"{settings.API_V1_PREFIX}/paypal/config",
+            "paypal_quote": f"{settings.API_V1_PREFIX}/paypal/quote",
+            "paypal_orders": f"{settings.API_V1_PREFIX}/paypal/orders/create",
+            "paypal_transactions": f"{settings.API_V1_PREFIX}/paypal/transactions"
         }
     }
 

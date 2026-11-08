@@ -18,11 +18,13 @@ import {
   X,
   Bug,
   ExternalLink,
+  DollarSign,
 } from 'lucide-react';
 import Toast from '../components/common/Toast';
 import Avatar from '../components/common/Avatar';
 import Badge from '../components/common/Badge';
 import Button from '../components/common/Button';
+import PayPalTransactionsModal from '../components/common/PayPalTransactionsModal';
 
 export default function AppLayout() {
   const { user, logout } = useAuth();
@@ -39,6 +41,7 @@ export default function AppLayout() {
   const location = useLocation();
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [bountyModalOpen, setBountyModalOpen] = useState(false);
 
   const activeInv = investigations && investigations.length > 0 ? investigations[0] : null;
   const liveInvPath = activeInv ? `/investigations/${activeInv.id}` : '/investigations/new';
@@ -149,7 +152,7 @@ export default function AppLayout() {
           </div>
 
           {/* Quick Action Button */}
-          <div className="p-3">
+          <div className="p-3 space-y-2">
             <Link
               to="/investigations/new"
               onClick={() => setSidebarOpen(false)}
@@ -158,6 +161,23 @@ export default function AppLayout() {
               <PlusCircle className="w-4 h-4" />
               <span>New Investigation</span>
             </Link>
+
+            <button
+              type="button"
+              onClick={() => {
+                setBountyModalOpen(true);
+                setSidebarOpen(false);
+              }}
+              className="w-full flex items-center justify-between px-3 py-2 rounded-lg bg-[#EFF6FF] border border-[#BFDBFE] text-[#2563EB] hover:bg-[#DBEAFE] text-xs font-semibold shadow-xs transition-all"
+            >
+              <div className="flex items-center gap-1.5">
+                <DollarSign className="w-3.5 h-3.5" />
+                <span>PayPal Bounties</span>
+              </div>
+              <span className="text-[10px] bg-[#DBEAFE] text-[#1E40AF] px-1.5 py-0.5 rounded font-mono">
+                SANDBOX
+              </span>
+            </button>
           </div>
 
           {/* Main Navigation */}
@@ -353,6 +373,12 @@ export default function AppLayout() {
           <Outlet />
         </main>
       </div>
+
+      {/* PayPal Transactions & Bounty Ledger Modal */}
+      <PayPalTransactionsModal
+        isOpen={bountyModalOpen}
+        onClose={() => setBountyModalOpen(false)}
+      />
     </div>
   );
 }

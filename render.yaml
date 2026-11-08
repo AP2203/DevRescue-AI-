@@ -1,0 +1,45 @@
+# Render Infrastructure as Code Blueprint for DevRescue AI Backend
+# Deploy with one click: https://render.com/deploy
+services:
+  - type: web
+    name: devrescue-ai-backend
+    env: python
+    region: oregon
+    plan: starter
+    branch: main
+    buildCommand: "cd backend && pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1"
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: HOST
+        value: 0.0.0.0
+      - key: FRONTEND_URL
+        value: https://dev-rescue-ai.vercel.app
+      - key: ALLOWED_ORIGINS
+        value: https://dev-rescue-ai.vercel.app,http://localhost:5173,http://127.0.0.1:5173
+      # PayPal Developer Platform (Sandbox & Orders API v2)
+      - key: PAYPAL_MODE
+        value: sandbox
+      - key: PAYPAL_API_BASE
+        value: https://api-m.sandbox.paypal.com
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      # NVIDIA Nemotron 3.5 AI Integration
+      - key: NVIDIA_BASE_URL
+        value: https://integrate.api.nvidia.com/v1
+      - key: NEMOTRON_MODEL
+        value: nvidia/nemotron-3.5-lightning-30b-a3b
+      - key: NVIDIA_API_KEY
+        sync: false
+      # GitHub OAuth Integration
+      - key: GITHUB_CLIENT_ID
+        sync: false
+      - key: GITHUB_CLIENT_SECRET
+        sync: false
+      - key: GITHUB_REDIRECT_URI
+        value: https://devrescue-ai-backend.onrender.com/api/github/callback
